@@ -842,6 +842,7 @@ static const StreamType MISC_types[] = {
 static const StreamType REGD_types[] = {
     { MKTAG('d', 'r', 'a', 'c'), AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_DIRAC },
     { MKTAG('A', 'C', '-', '3'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AC3   },
+    { MKTAG('A', 'C', '-', '4'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AC4   },
     { MKTAG('B', 'S', 'S', 'D'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_S302M },
     { MKTAG('D', 'T', 'S', '1'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_DTS   },
     { MKTAG('D', 'T', 'S', '2'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_DTS   },
@@ -1992,6 +1993,13 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
             mpegts_find_stream_type(st, st->codecpar->codec_tag, REGD_types);
             if (st->codecpar->codec_tag == MKTAG('B', 'S', 'S', 'D'))
                 st->internal->request_probe = 50;
+            /* a private stream only guessed to be AC-4, whose registration says
+             * otherwise (e.g. STPP subtitles), is plain data again */
+            if (st->codecpar->codec_id == AV_CODEC_ID_AC4 && st->internal->request_probe > 0 &&
+                st->codecpar->codec_tag != MKTAG('A', 'C', '-', '4')) {
+                st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+                st->codecpar->codec_id   = AV_CODEC_ID_BIN_DATA;
+            }
         }
         break;
     case 0x52: /* stream identifier descriptor */

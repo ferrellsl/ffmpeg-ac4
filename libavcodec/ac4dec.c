@@ -85,7 +85,7 @@ typedef struct SubstreamChannelParameters {
     uint8_t different_framing;
     uint8_t max_sfb_side[2];
     uint8_t max_sfb[2];
-    uint8_t scale_factor_grouping[15];
+    uint8_t scale_factor_grouping[16];
 
     uint8_t num_windows;
     uint8_t num_window_groups;
@@ -1605,6 +1605,10 @@ static int get_msfbl_bits(int transf_length)
 
 static int get_grp_bits(AC4DecodeContext *s, SubstreamChannel *ssch)
 {
+    /* only 0..3 index the tables (4 marks an LFE channel) */
+    if (ssch->scp.transf_length_idx[0] > 3 || ssch->scp.transf_length_idx[1] > 3)
+        return 0;
+
     if (s->frame_len_base >= 1536 && ssch->scp.long_frame == 1)
         return 0;
 
@@ -2026,7 +2030,7 @@ static int asf_psy_info(AC4DecodeContext *s, Substream *ss,
     }
 
     memset(ssch->scp.scale_factor_grouping, 0, sizeof(ssch->scp.scale_factor_grouping));
-    for (int i = 0; i < n_grp_bits; i++)
+    for (int i = 0; i < FFMIN(n_grp_bits, 15); i++)
         ssch->scp.scale_factor_grouping[i] = get_bits1(gb);
 
     return asf_psy_elements(s, ss, ssch, n_grp_bits);
@@ -3749,14 +3753,15 @@ static int sf_info_lfe(AC4DecodeContext *s, Substream *ss,
 {
     GetBitContext *gb = &s->gbc;
     int n_msfbl_bits = get_msfbl_bits(s->frame_len_base);
-    int n_grp_bits = get_grp_bits(s, ssch);
 
+    /* the LFE is one long window: no window grouping (get_grp_bits() would
+     * look at this channel's previous transform lengths) */
     ssch->scp.long_frame = 1;
     ssch->scp.max_sfb[0] = get_bits(gb, n_msfbl_bits);
     ssch->scp.num_window_groups = 1;
     ssch->scp.transf_length_idx[0] = 4;
 
-    return asf_psy_elements(s, ss, ssch, n_grp_bits);
+    return asf_psy_elements(s, ss, ssch, 0);
 }
 
 static int mono_data(AC4DecodeContext *s, Substream *ss,
@@ -4987,15 +4992,51 @@ static int get_qnoise_scale_factors(AC4DecodeContext *s, SubstreamChannel *ssch,
     return 0;
 }
 
-static void prepare_channel(AC4DecodeContext *s, int ch)
+/* Whether a channel's windows, as parsed (or left over from an earlier frame
+ * when this one was not fully parsed, as in immersive streams), fit the
+ * spectrum and pcm buffers. */
+static int channel_windows_valid(AC4DecodeContext *s, SubstreamChannel *ssch)
+{
+    int win = 0, k = 0;
+
+    if (ssch->scp.num_window_groups > FF_ARRAY_ELEMS(ssch->scp.num_win_in_group))
+        return 0;
+    for (int g = 0; g < ssch->scp.num_window_groups; g++) {
+        int N = get_transf_length(s, ssch, g, NULL);
+        int max_sfb = get_max_sfb(s, ssch, g);
+        const uint16_t *sfb_offset;
+
+        if (N <= 0 || N > FF_ARRAY_ELEMS(ssch->pcm) || max_sfb < 0 ||
+            max_sfb > get_sfb_size(N))
+            return 0;
+        sfb_offset = get_sfb_offset(N);
+        if (!sfb_offset)
+            return 0;
+        for (int w = 0; w < ssch->scp.num_win_in_group[g]; w++, win++) {
+            if (win >= FF_ARRAY_ELEMS(ssch->win_offset) || ssch->win_offset[win] < 0 ||
+                ssch->win_offset[win] + N > FF_ARRAY_ELEMS(ssch->pcm) ||
+                sfb_offset[max_sfb] > N)
+                return 0;
+            k += sfb_offset[max_sfb];
+        }
+    }
+    return k <= FF_ARRAY_ELEMS(ssch->scaled_spec);
+}
+
+static int prepare_channel(AC4DecodeContext *s, int ch)
 {
     Substream *ss = &s->substream;
     SubstreamChannel *ssch = &ss->ssch[ch];
 
+    if (!channel_windows_valid(s, ssch)) {
+        av_log(s->avctx, AV_LOG_ERROR, "channel %d: invalid window layout\n", ch);
+        return AVERROR_INVALIDDATA;
+    }
     spectral_reordering(s, ssch);
     spectral_synthesis(s, ssch);
 
     qmf_analysis(s, ssch);
+    return 0;
 }
 
 static void aspx_processing(AC4DecodeContext *s, SubstreamChannel *ssch)
@@ -5812,7 +5853,8 @@ static int ac4_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     for (int ch = 0; ch < avctx->channels; ch++)
-        prepare_channel(s, ch);
+        if ((ret = prepare_channel(s, ch)) < 0)
+            return ret;
 
     switch (ssinfo->channel_mode) {
     case 0:

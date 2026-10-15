@@ -16,14 +16,8 @@ The decoder has been ported to FFmpeg 6.0.1, the FFmpeg that Kodi 21.3
 is on its [Releases](https://github.com/ferrellsl/kodi-ac4/releases) page.
 The port is a single patch to FFmpeg 6.0.1,
 [`0006-ffmpeg-ac4-decoder.patch`](https://github.com/ferrellsl/kodi-ac4/blob/main/patches/0006-ffmpeg-ac4-decoder.patch),
-and contains the channel-order fix below. It also has fixes that this 4.3 tree
-does not:
-
-- immersive (IMS) streams are rejected as invalid data instead of crashing the
-  decoder;
-- an ATSC 3.0 subtitle stream (STPP) is no longer taken for a 0-channel AC-4
-  track;
-- the LFE no longer reads past the window-grouping tables.
+and has the same decoder fixes as this tree (see "Changes in this repository"
+below).
 
 ## What it decodes
 
@@ -40,8 +34,8 @@ does not:
   in such streams the two surround channels are silent.
 - **A-SPX (the high-frequency extension) is applied only to mono and
   stereo.** 5.1 streams that use it decode with a reduced top end.
-- **Immersive AC-4 (IMS, A-JOC / Atmos) is not supported**, and such streams
-  can make the decoder fail.
+- **Immersive AC-4 (IMS, A-JOC / Atmos) is not supported**: such frames are
+  rejected as invalid data.
 
 ## Changes in this repository
 
@@ -52,6 +46,22 @@ does not:
   output is now reordered to FFmpeg's layouts (see the end of
   `ac4_decode_frame` in `libavcodec/ac4dec.c`). Checked against 5.1 AC-4
   recorded from ATSC 3.0 broadcasts: the LFE is now output channel 4.
+- **Immersive streams no longer crash the decoder.** In immersive (IMS)
+  streams, channels could reach the spectrum reordering with window offsets
+  left over from an earlier frame, and the decoder wrote far past its buffers
+  (a segfault, which in Kodi closes the player). Each channel's window layout
+  is now checked against the buffers first (`channel_windows_valid()`), and a
+  frame that doesn't fit is rejected as invalid data.
+- **No phantom AC-4 track from subtitles.** An MPEG-TS private stream that
+  isn't otherwise identified is assumed to be AC-4, which also caught the
+  STPP (TTML subtitle) stream of ATSC 3.0 broadcasts and listed it as a
+  0-channel AC-4 track. A registration descriptor now decides: `AC-4` marks
+  AC-4, anything else (such as `STPP`) leaves the stream as data.
+- **Out-of-bounds reads and writes in window grouping.** The LFE channel looked
+  up its window-grouping bit count with a transform index of 4, past the end
+  of the tables; it is one long window, so it now uses none. The
+  scale-factor grouping array also had room for one entry fewer than the
+  decoder can write.
 - **Building with current compilers.** `libavcodec/x86/mathops.h` has
   FFmpeg's later fix for inline assembly that newer assemblers reject
   ("operand type mismatch for `shr`"), so the tree builds with today's
