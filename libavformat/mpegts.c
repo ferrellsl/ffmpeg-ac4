@@ -859,6 +859,7 @@ static const StreamType HLS_SAMPLE_ENC_types[] = {
 static const StreamType REGD_types[] = {
     { MKTAG('d', 'r', 'a', 'c'), AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_DIRAC },
     { MKTAG('A', 'C', '-', '3'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AC3   },
+    { MKTAG('A', 'C', '-', '4'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AC4   },
     { MKTAG('B', 'S', 'S', 'D'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_S302M },
     { MKTAG('D', 'T', 'S', '1'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_DTS   },
     { MKTAG('D', 'T', 'S', '2'), AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_DTS   },
@@ -976,8 +977,8 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
             (sti->request_probe > 0 && sti->request_probe < AVPROBE_SCORE_STREAM_RETRY / 5)) &&
         sti->probe_packets > 0 &&
         stream_type == STREAM_TYPE_PRIVATE_DATA) {
-        st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
-        st->codecpar->codec_id   = AV_CODEC_ID_BIN_DATA;
+        st->codecpar->codec_type = pes->stream_type == 6 ? AVMEDIA_TYPE_AUDIO : AVMEDIA_TYPE_DATA;
+        st->codecpar->codec_id   = pes->stream_type == 6 ? AV_CODEC_ID_AC4 : AV_CODEC_ID_BIN_DATA;
         sti->request_probe = AVPROBE_SCORE_STREAM_RETRY / 5;
     }
 
@@ -2022,6 +2023,13 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
             mpegts_find_stream_type(st, st->codecpar->codec_tag, REGD_types);
             if (st->codecpar->codec_tag == MKTAG('B', 'S', 'S', 'D'))
                 sti->request_probe = 50;
+            /* a private stream only guessed to be AC-4, whose registration says
+             * otherwise (e.g. STPP subtitles), is plain data again */
+            if (st->codecpar->codec_id == AV_CODEC_ID_AC4 && sti->request_probe > 0 &&
+                st->codecpar->codec_tag != MKTAG('A', 'C', '-', '4')) {
+                st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+                st->codecpar->codec_id   = AV_CODEC_ID_BIN_DATA;
+            }
         }
         break;
     case 0x52: /* stream identifier descriptor */
@@ -2068,6 +2076,13 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
                 sti->need_parsing = AVSTREAM_PARSE_FULL;
                 sti->need_context_update = 1;
             }
+        }
+        if (ext_desc_tag == 0x15) { /* AC-4 descriptor */
+            st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+            st->codecpar->codec_id = AV_CODEC_ID_AC4;
+            sti->request_probe = 0;
+
+            sti->need_context_update = 1;
         }
         if (ext_desc_tag == 0x06) { /* supplementary audio descriptor */
             int flags;
