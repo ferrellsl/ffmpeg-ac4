@@ -5826,8 +5826,22 @@ static int ac4_decode_frame(AVCodecContext *avctx, void *data,
         break;
     }
 
-    for (int ch = 0; ch < avctx->channels; ch++)
-        decode_channel(s, ch, (float *)frame->extended_data[ch]);
+    /* The decoder keeps the LFE after the main channels (5.1: ssch[5],
+     * 7.1: ssch[7]); FFmpeg's layouts want it fourth (FL FR FC LFE ...).
+     * out_order[n] is the decoder's channel that becomes output channel n. */
+    {
+        static const uint8_t order_5_1[6] = { 0, 1, 2, 5, 3, 4 };
+        static const uint8_t order_7_1[8] = { 0, 1, 2, 7, 3, 4, 5, 6 };
+        const uint8_t *out_order = NULL;
+
+        if (ssinfo->channel_mode == 4)
+            out_order = order_5_1;
+        else if (ssinfo->channel_mode == 6)
+            out_order = order_7_1;
+
+        for (int ch = 0; ch < avctx->channels; ch++)
+            decode_channel(s, out_order ? out_order[ch] : ch, (float *)frame->extended_data[ch]);
+    }
 
     frame->key_frame = s->iframe_global;
 

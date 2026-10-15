@@ -113,19 +113,33 @@ __asm__ volatile(\
 // avoid +32 for shift optimization (gcc should do that ...)
 #define NEG_SSR32 NEG_SSR32
 static inline  int32_t NEG_SSR32( int32_t a, int8_t s){
-    __asm__ ("sarl %1, %0\n\t"
-         : "+r" (a)
-         : "ic" ((uint8_t)(-s))
-    );
+    /* (as FFmpeg itself later fixed it: newer assemblers take an immediate
+     * shift count only within 0..31, so a constant one is clipped to that) */
+    if (__builtin_constant_p(s))
+        __asm__ ("sarl %1, %0\n\t"
+             : "+r" (a)
+             : "i" (-s & 0x1F)
+        );
+    else
+        __asm__ ("sarl %1, %0\n\t"
+             : "+r" (a)
+             : "c" ((uint8_t)(-s))
+        );
     return a;
 }
 
 #define NEG_USR32 NEG_USR32
 static inline uint32_t NEG_USR32(uint32_t a, int8_t s){
-    __asm__ ("shrl %1, %0\n\t"
-         : "+r" (a)
-         : "ic" ((uint8_t)(-s))
-    );
+    if (__builtin_constant_p(s))
+        __asm__ ("shrl %1, %0\n\t"
+             : "+r" (a)
+             : "i" (-s & 0x1F)
+        );
+    else
+        __asm__ ("shrl %1, %0\n\t"
+             : "+r" (a)
+             : "c" ((uint8_t)(-s))
+        );
     return a;
 }
 

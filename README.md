@@ -1,3 +1,53 @@
+# FFmpeg with an AC-4 audio decoder
+
+This is FFmpeg 4.3 (a development snapshot from early 2021) with an **AC-4
+audio decoder**: Dolby's audio format used by ATSC 3.0 ("NextGen TV")
+broadcasts, some DVB services and streaming. The decoder,
+`libavcodec/ac4dec.c`, is Paul B Mahol's (2019); AC-4 is also read from raw
+`.ac4` files, MP4 and MPEG-TS.
+
+It is the FFmpeg behind a Kodi build that plays AC-4 sound.
+
+## What it decodes
+
+- Mono, stereo and 5.1 AC-4 (the forms broadcasters mostly use), and 7.1.
+- Several presentations in one stream: the decoder option `-presentation N`
+  chooses one (0 is the first).
+
+## Known limitations
+
+- **Surround channels coded parametrically (A-CPL) are not rebuilt.** Much
+  5.1 on ATSC 3.0 is sent as left, right, center and LFE, with the
+  surrounds described by parameters for the receiver to reconstruct. This
+  decoder reads those parameters but does not reconstruct the surrounds, so
+  in such streams the two surround channels are silent.
+- **A-SPX (the high-frequency extension) is applied only to mono and
+  stereo.** 5.1 streams that use it decode with a reduced top end.
+- **Immersive AC-4 (IMS, A-JOC / Atmos) is not supported**, and such streams
+  can make the decoder fail.
+
+## Changes in this repository
+
+- **Channel order (the LFE).** The decoder put the LFE after the main
+  channels, where FFmpeg's 5.1 and 7.1 layouts expect it fourth
+  (front left, front right, center, LFE, ...). In 5.1 the subwoofer got the
+  left surround and the LFE came out of the right surround speaker. The
+  output is now reordered to FFmpeg's layouts (see the end of
+  `ac4_decode_frame` in `libavcodec/ac4dec.c`). Checked against 5.1 AC-4
+  recorded from ATSC 3.0 broadcasts: the LFE is now output channel 4.
+- **Building with current compilers.** `libavcodec/x86/mathops.h` has
+  FFmpeg's later fix for inline assembly that newer assemblers reject
+  ("operand type mismatch for `shr`"), so the tree builds with today's
+  MSYS2/MinGW-w64 GCC.
+
+## Building
+
+As any FFmpeg of its time: `./configure` (for example
+`--enable-shared --disable-static`), then `make`. It has been built with
+MSYS2/MinGW-w64 and with Visual Studio 2019 (`--toolchain=msvc`).
+
+---
+
 FFmpeg README
 =============
 
