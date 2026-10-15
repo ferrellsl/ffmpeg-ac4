@@ -8,6 +8,23 @@ broadcasts, some DVB services and streaming. The decoder,
 
 It is the FFmpeg behind a Kodi build that plays AC-4 sound.
 
+## Kodi 21.3 and FFmpeg 6.0.1
+
+The decoder has been ported to FFmpeg 6.0.1, the FFmpeg that Kodi 21.3
+"Omega" uses, and a Kodi 21.3 for Windows with AC-4 is available at
+[ferrellsl/kodi-ac4](https://github.com/ferrellsl/kodi-ac4). The installer
+is on its [Releases](https://github.com/ferrellsl/kodi-ac4/releases) page.
+The port is a single patch to FFmpeg 6.0.1,
+[`0006-ffmpeg-ac4-decoder.patch`](https://github.com/ferrellsl/kodi-ac4/blob/main/patches/0006-ffmpeg-ac4-decoder.patch),
+and contains the channel-order fix below. It also has fixes that this 4.3 tree
+does not:
+
+- immersive (IMS) streams are rejected as invalid data instead of crashing the
+  decoder;
+- an ATSC 3.0 subtitle stream (STPP) is no longer taken for a 0-channel AC-4
+  track;
+- the LFE no longer reads past the window-grouping tables.
+
 ## What it decodes
 
 - Mono, stereo and 5.1 AC-4 (the forms broadcasters mostly use), and 7.1.
