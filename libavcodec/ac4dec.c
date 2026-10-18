@@ -4753,7 +4753,9 @@ static void qmf_synthesis(AC4DecodeContext *s, SubstreamChannel *ssch, float *pc
 
             for (int n = 0; n < 10; n++)
                 temp += w[64*n + sb];
-            pcm[ts*64 + sb] = temp;
+            /* (negated: without it every channel came out inverted against Dolby's own decode of
+             * the same programme - DD+ of the AC-4 Online Delivery Kit's example stream) */
+            pcm[ts*64 + sb] = -temp;
         }
     }
 }
@@ -6144,12 +6146,15 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     presentation = FFMIN(s->target_presentation, FFMAX(0, s->nb_presentations - 1));
     ssinfo = s->version == 2 ? &s->ssgroup[0].ssinfo : &s->pinfo[presentation].ssinfo;
-    avctx->sample_rate = s->fs_index ? 48000 : 44100;
+    /* The codec runs at an internal frame length tied to the video frame rate (frame_len_base);
+     * a sample rate converter takes it to the external rate (TS 103 190-1 4.3.3.2.6 and 6.2.15).
+     * Frames are output at that internal rate - external rate / decoder resampling ratio, e.g.
+     * 46034 Hz for 29.97 fps, 51200 Hz for 25 fps - for the caller to resample: played at 48 kHz
+     * they would be 4 % fast (29.97 fps) or 6 % slow (25 fps). */
+    avctx->sample_rate = av_rescale(s->fs_index ? 48000 : 44100,
+                                    s->resampling_ratio.den, s->resampling_ratio.num);
     av_channel_layout_uninit(&avctx->ch_layout);
     av_channel_layout_from_mask(&avctx->ch_layout, channel_mode_layouts[ssinfo->channel_mode]);
-    frame->nb_samples = av_rescale(s->frame_len_base,
-                                   s->resampling_ratio.num,
-                                   s->resampling_ratio.den);
     frame->nb_samples = s->frame_len_base;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
