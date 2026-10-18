@@ -417,6 +417,7 @@ typedef struct AC4DecodeContext {
     GetBitContext   gbc;                    ///< bitstream reader
 
     int             target_presentation;
+    int             aspx_5x;                 ///< apply A-SPX in 5.x elements (option, for comparison)
 
     int             version;
     int             sequence_counter;
@@ -5713,69 +5714,105 @@ static void assemble_hf_signal(AC4DecodeContext *s, SubstreamChannel *ssch)
     memcpy(ssch->Q_prev, ssch->Q, sizeof(ssch->Q));
 }
 
+/* A-SPX of one channel coded alone (aspx_data_1ch) */
+static void aspx_1ch(AC4DecodeContext *s, Substream *ss, int c)
+{
+    SubstreamChannel *ssch = &ss->ssch[c];
+
+    aspx_processing(s, ssch);
+    get_qsignal_scale_factors(s, ssch, 0);
+    get_qnoise_scale_factors(s, ssch, 0);
+    mono_deq_signal_factors(s, ssch);
+    mono_deq_noise_factors(s, ssch);
+    preflattening(s, ssch);
+    get_covariance(s, ssch);
+    get_alphas(s, ssch);
+    get_chirps(s, ssch);
+    create_high_signal(s, ss, ssch);
+    estimate_spectral_envelopes(s, ss, ssch);
+    map_signoise(s, ssch);
+    add_sinusoids(s, ssch);
+    generate_tones(s, ssch);
+    generate_noise(s, ssch);
+    assemble_hf_signal(s, ssch);
+}
+
+/* A-SPX of a channel pair coded together (aspx_data_2ch) */
+static void aspx_2ch(AC4DecodeContext *s, Substream *ss, int c0, int c1)
+{
+    SubstreamChannel *a = &ss->ssch[c0], *b = &ss->ssch[c1];
+
+    aspx_processing(s, a);
+    aspx_processing(s, b);
+    get_qsignal_scale_factors(s, a, 0);
+    get_qsignal_scale_factors(s, b, 1);
+    get_qnoise_scale_factors(s, a, 0);
+    get_qnoise_scale_factors(s, b, 1);
+    if (a->aspx_balance == 0) {
+        mono_deq_signal_factors(s, a);
+        mono_deq_signal_factors(s, b);
+        mono_deq_noise_factors(s, a);
+        mono_deq_noise_factors(s, b);
+    } else {
+        stereo_deq_signoise_factors(s, a, b);
+    }
+    preflattening(s, a);
+    preflattening(s, b);
+    get_covariance(s, a);
+    get_covariance(s, b);
+    get_alphas(s, a);
+    get_alphas(s, b);
+    get_chirps(s, a);
+    get_chirps(s, b);
+    create_high_signal(s, ss, a);
+    create_high_signal(s, ss, b);
+    estimate_spectral_envelopes(s, ss, a);
+    estimate_spectral_envelopes(s, ss, b);
+    map_signoise(s, a);
+    map_signoise(s, b);
+    add_sinusoids(s, a);
+    add_sinusoids(s, b);
+    generate_tones(s, a);
+    generate_tones(s, b);
+    generate_noise(s, a);
+    generate_noise(s, b);
+    assemble_hf_signal(s, a);
+    assemble_hf_signal(s, b);
+}
+
 static int mono_aspx_processing(AC4DecodeContext *s, Substream *ss)
 {
-    if (ss->codec_mode == CM_ASPX) {
-        aspx_processing(s, &ss->ssch[0]);
-        get_qsignal_scale_factors(s, &ss->ssch[0], 0);
-        get_qnoise_scale_factors(s, &ss->ssch[0], 0);
-        mono_deq_signal_factors(s, &ss->ssch[0]);
-        mono_deq_noise_factors(s, &ss->ssch[0]);
-        preflattening(s, &ss->ssch[0]);
-        get_covariance(s, &ss->ssch[0]);
-        get_alphas(s, &ss->ssch[0]);
-        get_chirps(s, &ss->ssch[0]);
-        create_high_signal(s, ss, &ss->ssch[0]);
-        estimate_spectral_envelopes(s, ss, &ss->ssch[0]);
-        map_signoise(s, &ss->ssch[0]);
-        add_sinusoids(s, &ss->ssch[0]);
-        generate_tones(s, &ss->ssch[0]);
-        generate_noise(s, &ss->ssch[0]);
-        assemble_hf_signal(s, &ss->ssch[0]);
-    }
+    if (ss->codec_mode == CM_ASPX)
+        aspx_1ch(s, ss, 0);
 
     return 0;
 }
 
 static int stereo_aspx_processing(AC4DecodeContext *s, Substream *ss)
 {
-    if (ss->codec_mode == CM_ASPX) {
-        aspx_processing(s, &ss->ssch[0]);
-        aspx_processing(s, &ss->ssch[1]);
-        get_qsignal_scale_factors(s, &ss->ssch[0], 0);
-        get_qsignal_scale_factors(s, &ss->ssch[1], 1);
-        get_qnoise_scale_factors(s, &ss->ssch[0], 0);
-        get_qnoise_scale_factors(s, &ss->ssch[1], 1);
-        if (ss->ssch[0].aspx_balance == 0) {
-            mono_deq_signal_factors(s, &ss->ssch[0]);
-            mono_deq_signal_factors(s, &ss->ssch[1]);
-            mono_deq_noise_factors(s, &ss->ssch[0]);
-            mono_deq_noise_factors(s, &ss->ssch[1]);
-        } else {
-            stereo_deq_signoise_factors(s, &ss->ssch[0], &ss->ssch[1]);
-        }
-        preflattening(s, &ss->ssch[0]);
-        preflattening(s, &ss->ssch[1]);
-        get_covariance(s, &ss->ssch[0]);
-        get_covariance(s, &ss->ssch[1]);
-        get_alphas(s, &ss->ssch[0]);
-        get_alphas(s, &ss->ssch[1]);
-        get_chirps(s, &ss->ssch[0]);
-        get_chirps(s, &ss->ssch[1]);
-        create_high_signal(s, ss, &ss->ssch[0]);
-        create_high_signal(s, ss, &ss->ssch[1]);
-        estimate_spectral_envelopes(s, ss, &ss->ssch[0]);
-        estimate_spectral_envelopes(s, ss, &ss->ssch[1]);
-        map_signoise(s, &ss->ssch[0]);
-        map_signoise(s, &ss->ssch[1]);
-        add_sinusoids(s, &ss->ssch[0]);
-        add_sinusoids(s, &ss->ssch[1]);
-        generate_tones(s, &ss->ssch[0]);
-        generate_tones(s, &ss->ssch[1]);
-        generate_noise(s, &ss->ssch[0]);
-        generate_noise(s, &ss->ssch[1]);
-        assemble_hf_signal(s, &ss->ssch[0]);
-        assemble_hf_signal(s, &ss->ssch[1]);
+    if (ss->codec_mode == CM_ASPX)
+        aspx_2ch(s, ss, 0, 1);
+
+    return 0;
+}
+
+/* A-SPX of a 5.x element: the channels and pairs that carry A-SPX data (channel_element_5x) */
+static int m5channel_aspx_processing(AC4DecodeContext *s, Substream *ss)
+{
+    switch (ss->codec_mode) {
+    case CM_ASPX:
+        aspx_2ch(s, ss, 0, 1);
+        aspx_2ch(s, ss, 2, 3);
+        aspx_1ch(s, ss, 4);
+        break;
+    case CM_ASPX_ACPL_1:
+    case CM_ASPX_ACPL_2:
+        aspx_2ch(s, ss, 0, 1);
+        aspx_1ch(s, ss, 2);
+        break;
+    case CM_ASPX_ACPL_3:
+        aspx_2ch(s, ss, 0, 1);
+        break;
     }
 
     return 0;
@@ -6171,6 +6208,9 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         break;
     case 3:
     case 4:
+        // (A-SPX first: the A-CPL tool works on its output - TS 103 190-1 5.7.7.1)
+        if (s->aspx_5x)
+            m5channel_aspx_processing(s, &s->substream);
         if (s->substream.codec_mode == CM_ASPX_ACPL_1 || s->substream.codec_mode == CM_ASPX_ACPL_2)
             acpl_5x_processing(s, &s->substream);
         break;
@@ -6226,6 +6266,7 @@ static av_cold int ac4_decode_end(AVCodecContext *avctx)
 
 static const AVOption options[] = {
     { "presentation", "select presentation", OFFSET(target_presentation), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, INT_MAX, FLAGS },
+    { "aspx_5x", "apply A-SPX in 5.x channel elements", OFFSET(aspx_5x), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, FLAGS },
     { NULL},
 };
 
