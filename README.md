@@ -15,30 +15,70 @@ The decoder has been ported to FFmpeg 6.0.1, the FFmpeg that Kodi 21.3
 [ferrellsl/kodi-ac4](https://github.com/ferrellsl/kodi-ac4). The installer
 is on its [Releases](https://github.com/ferrellsl/kodi-ac4/releases) page.
 The port is a single patch to FFmpeg 6.0.1,
-[`0006-ffmpeg-ac4-decoder.patch`](https://github.com/ferrellsl/kodi-ac4/blob/main/patches/0006-ffmpeg-ac4-decoder.patch),
-and has the same decoder fixes as this tree (see "Changes in this repository"
+[`0006-ffmpeg-ac4-decoder.patch`](https://github.com/ferrellsl/kodi-ac4/blob/main/patches/0006-ffmpeg-ac4-decoder.patch);
+the FFmpeg 6.0.1 tree it comes from is the branch
+[`ffmpeg-6.0.1`](https://github.com/ferrellsl/ffmpeg-ac4/tree/ffmpeg-6.0.1)
+of this repository. Both decode the same (see "Changes in this repository"
 below).
 
 ## What it decodes
 
 - Mono, stereo and 5.1 AC-4 (the forms broadcasters mostly use), and 7.1.
+- 5.1 with parametric surrounds (A-CPL) and the high-frequency extension
+  (A-SPX), as ATSC 3.0 broadcasters send it.
 - Several presentations in one stream: the decoder option `-presentation N`
   chooses one (0 is the first).
 
+**Output sample rate.** AC-4 runs at an internal frame length tied to the
+video frame rate, and the specification has the decoder resample it to the
+external rate. This decoder outputs the internal rate and leaves the
+resampling to the caller (FFmpeg's resampler, or Kodi's): **46034 Hz** for
+29.97 fps (ATSC 3.0), 46080 Hz for 30 fps, 51200 Hz for 25 fps, 48000 Hz where
+no resampling is needed. To get 48 kHz from the command line, add
+`-ar 48000`.
+
+## How it was checked
+
+Against Dolby's own decode of the same program: the AC-4 Online Delivery
+Kit 1.5 from Dolby carries the same material as AC-4 5.1 and as Dolby Digital
+Plus 5.1 (decoded by FFmpeg's E-AC-3 decoder). Correlation of the decoded
+waveforms below 4 kHz: center 1.00, LFE 0.96, front left/right 0.92/0.91,
+the A-CPL surrounds 0.70/0.64; the channel levels agree within about half a
+dB of each other (all about 4 dB below the DD+ track: its loudness
+normalization differs). The kit's channel-identification signal decodes
+with every channel within 1-2 dB of the DD+ version, second by second, and
+its 29.97 fps version lasts as long as the reference.
+
 ## Known limitations
 
-- **Surround channels coded parametrically (A-CPL) are not rebuilt.** Much
-  5.1 on ATSC 3.0 is sent as left, right, center and LFE, with the
-  surrounds described by parameters for the receiver to reconstruct. This
-  decoder reads those parameters but does not reconstruct the surrounds, so
-  in such streams the two surround channels are silent.
-- **A-SPX (the high-frequency extension) is applied only to mono and
-  stereo.** 5.1 streams that use it decode with a reduced top end.
-- **Immersive AC-4 (IMS, A-JOC / Atmos) is not supported**: such frames are
+- **A-CPL is done for 5.x codec modes ASPX_ACPL_1 and ASPX_ACPL_2** (those
+  found in ATSC 3.0 broadcasts and Dolby's test material). ASPX_ACPL_3 and
+  A-CPL in 7.x elements are not done yet: no test material uses them so far.
+- **Immersive AC-4 (IMS, A-JOC / Atmos, and 5.1.4 and other channel
+  configurations with height channels) is not supported**: such frames are
   rejected as invalid data.
 
 ## Changes in this repository
 
+- **Parametric surrounds (A-CPL) for 5.x.** Much 5.1 on ATSC 3.0 is sent as
+  left, right, center and LFE, the surrounds described by parameters for the
+  decoder to rebuild. The parameters were parsed but never used, so the
+  surrounds were silent - and the fronts came out about 6 dB too quiet, since
+  what is sent for them is a scaled mix of front and surround. Now done as in
+  ETSI TS 103 190-1 V1.4.1 clause 5.7.7: differential decoding and
+  dequantization of the alpha and beta parameters, the decorrelators and
+  transient ducker, and the A-CPL modules in the QMF domain.
+- **High frequencies (A-SPX) for 5.x.** A-SPX was applied to mono and stereo
+  only, so 5.1 stopped at the core coder's bandwidth (about 14 kHz). The
+  stereo and mono A-SPX processing now serves 5.x channels too, before A-CPL.
+  (Decoder option `aspx_5x` turns it off, for comparison.)
+- **Sample rate (speed and pitch).** The decoder output each frame at 48 kHz
+  without the resampling the specification requires (TS 103 190-1 4.3.3.2.6,
+  6.2.15): ATSC 3.0 audio (29.97 fps) played 4 % fast and 0.7 semitone sharp,
+  25 fps material 6.7 % slow. It now reports the internal rate (see "Output
+  sample rate" above).
+- **Polarity.** Every channel came out inverted against Dolby's decode; the
+  output is now the right way up.
 - **Channel order (the LFE).** The decoder put the LFE after the main
   channels, where FFmpeg's 5.1 and 7.1 layouts expect it fourth
   (front left, front right, center, LFE, ...). In 5.1 the subwoofer got the

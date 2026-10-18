@@ -227,7 +227,18 @@ typedef struct SubstreamChannel {
     int     acpl_interpolation_type;
     int     acpl_num_param_sets_cod;
     int     acpl_param_timeslot[2];
-    int     acpl_data[11][16];
+    int     acpl_data[11][2][16];       ///< Huffman-decoded values (cb_off removed), per data type and parameter set
+    int     acpl_diff_type[11][2];      ///< 0: coded across frequency, 1: across time
+    int     acpl_q_prev[11][16];        ///< last quantized parameter set, for time-differential decoding
+
+    /* A-CPL module state (TS 103 190-1 5.7.7), kept in the module's first input channel */
+    float   acpl_alpha_prev[64];        ///< dequantized alpha per QMF subband, end of the previous frame
+    float   acpl_beta_prev[64];
+    float   acpl_xhist[2][64][16];      ///< decorrelator input, the last 16 QMF time slots (re, im)
+    float   acpl_yhist[2][64][8];       ///< decorrelator output, the last 8 time slots
+    float   acpl_peak_decay[15];        ///< transient ducker state
+    float   acpl_smooth[15];
+    float   acpl_smooth_peak_diff[15];
 
     int     start_block, end_block;
     int     stride_flag;
@@ -403,6 +414,7 @@ typedef struct AC4DecodeContext {
     GetBitContext   gbc;                    ///< bitstream reader
 
     int             target_presentation;
+    int             aspx_5x;                 ///< apply A-SPX in 5.x elements (option, for comparison)
 
     int             version;
     int             sequence_counter;
@@ -3435,10 +3447,18 @@ static VLC *get_acpl_hcb(int data_type, int quant_mode, int hcb_type)
     return acpl_cb;
 }
 
+/* Huffman codebook offsets cb_off (TS 103 190-1 table A.34 ff.), by [alpha, beta, beta3, gamma][fine, coarse][F0, DF, DT] */
+static const uint8_t acpl_cb_off[4][2][3] = {
+    { { 0, 32, 32 }, { 0, 16, 16 } },
+    { { 0,  8,  8 }, { 0,  4,  4 } },
+    { { 0, 16, 16 }, { 0,  8,  8 } },
+    { { 20, 40, 40 }, { 10, 20, 20 } },
+};
+
 static int acpl_huff_data(AC4DecodeContext *s,
                           int data_type, int data_bands,
                           int start_band, int quant_mode,
-                          int *data)
+                          int *data, int *diff_type_out)
 {
     GetBitContext *gb = &s->gbc;
     int diff_type;
@@ -3462,6 +3482,7 @@ static int acpl_huff_data(AC4DecodeContext *s,
     };
 
     diff_type = get_bits1(gb);
+    *diff_type_out = diff_type;
     if (diff_type == 0) { // DIFF_FREQ
         acpl_cb = get_acpl_hcb(data_type, quant_mode, F0);
         data[start_band] = get_vlc2(gb, acpl_cb->table, acpl_cb->bits, 3);
@@ -3469,6 +3490,7 @@ static int acpl_huff_data(AC4DecodeContext *s,
             av_log(s->avctx, AV_LOG_ERROR, "DIFF_FREQ 1\n");
             return AVERROR_INVALIDDATA;
         }
+        data[start_band] -= acpl_cb_off[data_type][quant_mode][F0];
         acpl_cb = get_acpl_hcb(data_type, quant_mode, DF);
         for (int i = start_band + 1; i < data_bands; i++) {
             data[i] = get_vlc2(gb, acpl_cb->table, acpl_cb->bits, 3);
@@ -3476,6 +3498,7 @@ static int acpl_huff_data(AC4DecodeContext *s,
                 av_log(s->avctx, AV_LOG_ERROR, "DIFF_FREQ 2\n");
                 return AVERROR_INVALIDDATA;
             }
+            data[i] -= acpl_cb_off[data_type][quant_mode][DF];
         }
     } else { // DIFF_TIME
         acpl_cb = get_acpl_hcb(data_type, quant_mode, DT);
@@ -3485,6 +3508,7 @@ static int acpl_huff_data(AC4DecodeContext *s,
                 av_log(s->avctx, AV_LOG_ERROR, "DIFF_TIME\n");
                 return AVERROR_INVALIDDATA;
             }
+            data[i] -= acpl_cb_off[data_type][quant_mode][DT];
         }
     }
 
@@ -3501,7 +3525,8 @@ static int acpl_ec_data(AC4DecodeContext *s, Substream *ss,
     for (int ps = 0; ps < ssch->acpl_num_param_sets_cod + 1; ps++) {
         ret = acpl_huff_data(s, data_type, data_bands,
                              start_band, quant_mode,
-                             ssch->acpl_data[data_type]);
+                             ssch->acpl_data[data_type][ps],
+                             &ssch->acpl_diff_type[data_type][ps]);
         if (ret < 0)
             return ret;
     }
@@ -4725,7 +4750,9 @@ static void qmf_synthesis(AC4DecodeContext *s, SubstreamChannel *ssch, float *pc
 
             for (int n = 0; n < 10; n++)
                 temp += w[64*n + sb];
-            pcm[ts*64 + sb] = temp;
+            /* (negated: without it every channel came out inverted against Dolby's own decode of
+             * the same programme - DD+ of the AC-4 Online Delivery Kit's example stream) */
+            pcm[ts*64 + sb] = -temp;
         }
     }
 }
@@ -5686,72 +5713,388 @@ static void assemble_hf_signal(AC4DecodeContext *s, SubstreamChannel *ssch)
     memcpy(ssch->Q_prev, ssch->Q, sizeof(ssch->Q));
 }
 
+/* A-SPX of one channel coded alone (aspx_data_1ch) */
+static void aspx_1ch(AC4DecodeContext *s, Substream *ss, int c)
+{
+    SubstreamChannel *ssch = &ss->ssch[c];
+
+    aspx_processing(s, ssch);
+    get_qsignal_scale_factors(s, ssch, 0);
+    get_qnoise_scale_factors(s, ssch, 0);
+    mono_deq_signal_factors(s, ssch);
+    mono_deq_noise_factors(s, ssch);
+    preflattening(s, ssch);
+    get_covariance(s, ssch);
+    get_alphas(s, ssch);
+    get_chirps(s, ssch);
+    create_high_signal(s, ss, ssch);
+    estimate_spectral_envelopes(s, ss, ssch);
+    map_signoise(s, ssch);
+    add_sinusoids(s, ssch);
+    generate_tones(s, ssch);
+    generate_noise(s, ssch);
+    assemble_hf_signal(s, ssch);
+}
+
+/* A-SPX of a channel pair coded together (aspx_data_2ch) */
+static void aspx_2ch(AC4DecodeContext *s, Substream *ss, int c0, int c1)
+{
+    SubstreamChannel *a = &ss->ssch[c0], *b = &ss->ssch[c1];
+
+    aspx_processing(s, a);
+    aspx_processing(s, b);
+    get_qsignal_scale_factors(s, a, 0);
+    get_qsignal_scale_factors(s, b, 1);
+    get_qnoise_scale_factors(s, a, 0);
+    get_qnoise_scale_factors(s, b, 1);
+    if (a->aspx_balance == 0) {
+        mono_deq_signal_factors(s, a);
+        mono_deq_signal_factors(s, b);
+        mono_deq_noise_factors(s, a);
+        mono_deq_noise_factors(s, b);
+    } else {
+        stereo_deq_signoise_factors(s, a, b);
+    }
+    preflattening(s, a);
+    preflattening(s, b);
+    get_covariance(s, a);
+    get_covariance(s, b);
+    get_alphas(s, a);
+    get_alphas(s, b);
+    get_chirps(s, a);
+    get_chirps(s, b);
+    create_high_signal(s, ss, a);
+    create_high_signal(s, ss, b);
+    estimate_spectral_envelopes(s, ss, a);
+    estimate_spectral_envelopes(s, ss, b);
+    map_signoise(s, a);
+    map_signoise(s, b);
+    add_sinusoids(s, a);
+    add_sinusoids(s, b);
+    generate_tones(s, a);
+    generate_tones(s, b);
+    generate_noise(s, a);
+    generate_noise(s, b);
+    assemble_hf_signal(s, a);
+    assemble_hf_signal(s, b);
+}
+
 static int mono_aspx_processing(AC4DecodeContext *s, Substream *ss)
 {
-    if (ss->codec_mode == CM_ASPX) {
-        aspx_processing(s, &ss->ssch[0]);
-        get_qsignal_scale_factors(s, &ss->ssch[0], 0);
-        get_qnoise_scale_factors(s, &ss->ssch[0], 0);
-        mono_deq_signal_factors(s, &ss->ssch[0]);
-        mono_deq_noise_factors(s, &ss->ssch[0]);
-        preflattening(s, &ss->ssch[0]);
-        get_covariance(s, &ss->ssch[0]);
-        get_alphas(s, &ss->ssch[0]);
-        get_chirps(s, &ss->ssch[0]);
-        create_high_signal(s, ss, &ss->ssch[0]);
-        estimate_spectral_envelopes(s, ss, &ss->ssch[0]);
-        map_signoise(s, &ss->ssch[0]);
-        add_sinusoids(s, &ss->ssch[0]);
-        generate_tones(s, &ss->ssch[0]);
-        generate_noise(s, &ss->ssch[0]);
-        assemble_hf_signal(s, &ss->ssch[0]);
-    }
+    if (ss->codec_mode == CM_ASPX)
+        aspx_1ch(s, ss, 0);
 
     return 0;
 }
 
 static int stereo_aspx_processing(AC4DecodeContext *s, Substream *ss)
 {
-    if (ss->codec_mode == CM_ASPX) {
-        aspx_processing(s, &ss->ssch[0]);
-        aspx_processing(s, &ss->ssch[1]);
-        get_qsignal_scale_factors(s, &ss->ssch[0], 0);
-        get_qsignal_scale_factors(s, &ss->ssch[1], 1);
-        get_qnoise_scale_factors(s, &ss->ssch[0], 0);
-        get_qnoise_scale_factors(s, &ss->ssch[1], 1);
-        if (ss->ssch[0].aspx_balance == 0) {
-            mono_deq_signal_factors(s, &ss->ssch[0]);
-            mono_deq_signal_factors(s, &ss->ssch[1]);
-            mono_deq_noise_factors(s, &ss->ssch[0]);
-            mono_deq_noise_factors(s, &ss->ssch[1]);
-        } else {
-            stereo_deq_signoise_factors(s, &ss->ssch[0], &ss->ssch[1]);
-        }
-        preflattening(s, &ss->ssch[0]);
-        preflattening(s, &ss->ssch[1]);
-        get_covariance(s, &ss->ssch[0]);
-        get_covariance(s, &ss->ssch[1]);
-        get_alphas(s, &ss->ssch[0]);
-        get_alphas(s, &ss->ssch[1]);
-        get_chirps(s, &ss->ssch[0]);
-        get_chirps(s, &ss->ssch[1]);
-        create_high_signal(s, ss, &ss->ssch[0]);
-        create_high_signal(s, ss, &ss->ssch[1]);
-        estimate_spectral_envelopes(s, ss, &ss->ssch[0]);
-        estimate_spectral_envelopes(s, ss, &ss->ssch[1]);
-        map_signoise(s, &ss->ssch[0]);
-        map_signoise(s, &ss->ssch[1]);
-        add_sinusoids(s, &ss->ssch[0]);
-        add_sinusoids(s, &ss->ssch[1]);
-        generate_tones(s, &ss->ssch[0]);
-        generate_tones(s, &ss->ssch[1]);
-        generate_noise(s, &ss->ssch[0]);
-        generate_noise(s, &ss->ssch[1]);
-        assemble_hf_signal(s, &ss->ssch[0]);
-        assemble_hf_signal(s, &ss->ssch[1]);
+    if (ss->codec_mode == CM_ASPX)
+        aspx_2ch(s, ss, 0, 1);
+
+    return 0;
+}
+
+/* A-SPX of a 5.x element: the channels and pairs that carry A-SPX data (channel_element_5x) */
+static int m5channel_aspx_processing(AC4DecodeContext *s, Substream *ss)
+{
+    switch (ss->codec_mode) {
+    case CM_ASPX:
+        aspx_2ch(s, ss, 0, 1);
+        aspx_2ch(s, ss, 2, 3);
+        aspx_1ch(s, ss, 4);
+        break;
+    case CM_ASPX_ACPL_1:
+    case CM_ASPX_ACPL_2:
+        aspx_2ch(s, ss, 0, 1);
+        aspx_1ch(s, ss, 2);
+        break;
+    case CM_ASPX_ACPL_3:
+        aspx_2ch(s, ss, 0, 1);
+        break;
     }
 
     return 0;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Advanced coupling, A-CPL (ETSI TS 103 190-1 V1.4.1 clause 5.7.7): the surround channels of a
+ * 5.x element coded with 5_X_codec_mode ASPX_ACPL_1 or ASPX_ACPL_2, rebuilt in the QMF domain
+ * from the front channels, a decorrelated copy of them, and the transmitted alpha/beta parameters.
+ * (ASPX_ACPL_3, the 2-channel configuration, is not done yet.)
+ */
+
+/* tables 203 and 205: alpha by quantized value, and the beta table column it selects */
+static const float acpl_alpha_fine[33] = {
+    -2.000000f, -1.809375f, -1.637500f, -1.484375f, -1.350000f, -1.234375f, -1.137500f, -1.059375f,
+    -1.000000f, -0.940625f, -0.862500f, -0.765625f, -0.650000f, -0.515625f, -0.362500f, -0.190625f,
+     0.000000f,  0.190625f,  0.362500f,  0.515625f,  0.650000f,  0.765625f,  0.862500f,  0.940625f,
+     1.000000f,  1.059375f,  1.137500f,  1.234375f,  1.350000f,  1.484375f,  1.637500f,  1.809375f,
+     2.000000f,
+};
+static const uint8_t acpl_ibeta_fine[33] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+};
+static const float acpl_alpha_coarse[17] = {
+    -2.000000f, -1.637500f, -1.350000f, -1.137500f, -1.000000f, -0.862500f, -0.650000f, -0.362500f,
+     0.000000f,  0.362500f,  0.650000f,  0.862500f,  1.000000f,  1.137500f,  1.350000f,  1.637500f,
+     2.000000f,
+};
+static const uint8_t acpl_ibeta_coarse[17] = {
+    0, 1, 2, 3, 4, 3, 2, 1, 0, 1, 2, 3, 4, 3, 2, 1, 0,
+};
+
+/* tables 204 and 206: beta by [quantized beta][ibeta] */
+static const float acpl_beta_fine[9][9] = {
+    { 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f },
+    { 0.2375000f, 0.2035449f, 0.1729297f, 0.1456543f, 0.1217188f, 0.1011230f, 0.0838672f, 0.0699512f, 0.0593750f },
+    { 0.5500000f, 0.4713672f, 0.4004688f, 0.3373047f, 0.2818750f, 0.2341797f, 0.1942188f, 0.1619922f, 0.1375000f },
+    { 0.9375000f, 0.8034668f, 0.6826172f, 0.5749512f, 0.4804688f, 0.3991699f, 0.3310547f, 0.2761230f, 0.2343750f },
+    { 1.4000000f, 1.1998440f, 1.0193750f, 0.8585938f, 0.7175000f, 0.5960938f, 0.4943750f, 0.4123438f, 0.3500000f },
+    { 1.9375000f, 1.6604980f, 1.4107420f, 1.1882319f, 0.9929688f, 0.8249512f, 0.6841797f, 0.5706543f, 0.4843750f },
+    { 2.5500000f, 2.1854300f, 1.8567190f, 1.5638670f, 1.3068750f, 1.0857420f, 0.9004688f, 0.7510547f, 0.6375000f },
+    { 3.2375000f, 2.7746389f, 2.3573050f, 1.9854980f, 1.6592190f, 1.3784670f, 1.1432420f, 0.9535449f, 0.8093750f },
+    { 4.0000000f, 3.4281249f, 2.9124999f, 2.4531250f, 2.0500000f, 1.7031250f, 1.4125000f, 1.1781250f, 1.0000000f },
+};
+static const float acpl_beta_coarse[5][5] = {
+    { 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f, 0.0000000f },
+    { 0.5500000f, 0.4004688f, 0.2818750f, 0.1942188f, 0.1375000f },
+    { 1.4000000f, 1.0193750f, 0.7175000f, 0.4943750f, 0.3500000f },
+    { 2.5500000f, 1.8567190f, 1.3068750f, 0.9004688f, 0.6375000f },
+    { 4.0000000f, 2.9124999f, 2.0500000f, 1.4125000f, 1.0000000f },
+};
+
+/* tables 198-201: the decorrelators' all-pass coefficients a[i] by [region][decorrelator] */
+static const float acpl_decorr_a_k0[3][8] = {
+    { 1.0000f,  0.5306f, -0.4533f, -0.6248f,  0.0424f,  0.4237f,  0.4311f,  0.1688f },
+    { 1.0000f, -0.4178f,  0.1082f, -0.2368f, -0.1014f, -0.1052f, -0.3528f,  0.4665f },
+    { 1.0000f,  0.4007f,  0.4747f,  0.2611f, -0.1211f, -0.4248f, -0.2989f, -0.1932f },
+};
+static const float acpl_decorr_a_k1[3][5] = {
+    { 1.0000f,  0.5561f, -0.3039f, -0.5024f, -0.1850f },
+    { 1.0000f,  0.0425f,  0.3235f, -0.1556f,  0.4958f },
+    { 1.0000f, -0.4361f,  0.0345f,  0.5215f, -0.4178f },
+};
+static const float acpl_decorr_a_k2[3][3] = {
+    { 1.0000f,  0.5773f,  0.3321f },
+    { 1.0000f,  0.2327f, -0.3901f },
+    { 1.0000f, -0.6057f,  0.3804f },
+};
+
+#define ACPL_XHIST 16
+#define ACPL_YHIST 8
+
+/* pseudocode 121 and tables 203-206: alpha and beta of each parameter set, per parameter band */
+static void acpl_dequantize(Substream *ss, SubstreamChannel *ssch, int num_pset,
+                            float alpha[2][16], float beta[2][16])
+{
+    const int fine = ss->acpl_quant_mode[0] == 0;
+    const int start = ss->acpl_param_band;
+    const int bands = acpl_num_param_bands[ss->acpl_num_param_bands_id];
+    int q[2][2][16] = { { { 0 } } };                    // [alpha, beta][pset][band]
+
+    for (int t = 0; t < 2; t++) {
+        const int type = t ? BETA1 : ALPHA1;
+        int *prev = ssch->acpl_q_prev[type];
+
+        for (int ps = 0; ps < num_pset; ps++) {
+            const int *d = ssch->acpl_data[type][ps];
+
+            if (ssch->acpl_diff_type[type][ps] == 0) {  // DIFF_FREQ
+                q[t][ps][start] = d[start];
+                for (int i = start + 1; i < bands; i++)
+                    q[t][ps][i] = q[t][ps][i - 1] + d[i];
+            } else {                                    // DIFF_TIME
+                for (int i = start; i < bands; i++)
+                    q[t][ps][i] = prev[i] + d[i];
+            }
+            for (int i = start; i < bands; i++)
+                prev[i] = q[t][ps][i];
+        }
+    }
+
+    for (int ps = 0; ps < num_pset; ps++) {
+        for (int pb = 0; pb < 16; pb++) {
+            if (pb < start || pb >= bands) {
+                alpha[ps][pb] = beta[ps][pb] = 0.f;
+            } else if (fine) {
+                int a = av_clip(q[0][ps][pb], 0, 32), b = av_clip(q[1][ps][pb], 0, 8);
+                alpha[ps][pb] = acpl_alpha_fine[a];
+                beta[ps][pb]  = acpl_beta_fine[b][acpl_ibeta_fine[a]];
+            } else {
+                int a = av_clip(q[0][ps][pb], 0, 16), b = av_clip(q[1][ps][pb], 0, 4);
+                alpha[ps][pb] = acpl_alpha_coarse[a];
+                beta[ps][pb]  = acpl_beta_coarse[b][acpl_ibeta_coarse[a]];
+            }
+        }
+    }
+}
+
+/* pseudocode 109: a parameter's value at QMF time slot ts in subband sb */
+static float acpl_interpolate(AC4DecodeContext *s, SubstreamChannel *ssch, int num_pset,
+                              float param[2][16], const float *prev, int pb, int sb, int ts)
+{
+    const int num_ts = s->num_qmf_timeslots;
+
+    if (ssch->acpl_interpolation_type == 0) {   // smooth
+        if (num_pset == 1)
+            return prev[sb] + (ts + 1) * (param[0][pb] - prev[sb]) / num_ts;
+        else {
+            const int ts_2 = num_ts / 2;
+
+            if (ts < ts_2)
+                return prev[sb] + (ts + 1) * (param[0][pb] - prev[sb]) / ts_2;
+            return param[0][pb] + (ts - ts_2 + 1) * (param[1][pb] - param[0][pb]) / (num_ts - ts_2);
+        }
+    }
+    // steep
+    if (ts < ssch->acpl_param_timeslot[0])
+        return prev[sb];
+    if (num_pset == 1 || ts < ssch->acpl_param_timeslot[1])
+        return param[0][pb];
+    return param[1][pb];
+}
+
+/* pseudocode 111: decorrelator d over the whole frame, x and y as [re/im][ts][sb]; the filter
+ * history of the previous frames is kept in st */
+static void acpl_decorrelate(AC4DecodeContext *s, SubstreamChannel *st, int d,
+                             float (*x)[42][64], float (*y)[42][64])
+{
+    const int num_ts = s->num_qmf_timeslots;
+
+    for (int sb = 0; sb < 64; sb++) {
+        const float *a;
+        int len, delay;
+
+        if (sb < 7) {
+            a = acpl_decorr_a_k0[d]; len = 7; delay = 7;
+        } else if (sb < 23) {
+            a = acpl_decorr_a_k1[d]; len = 4; delay = 10;
+        } else {
+            a = acpl_decorr_a_k2[d]; len = 2; delay = 12;
+        }
+
+        for (int c = 0; c < 2; c++) {
+            float xb[ACPL_XHIST + 42], yb[ACPL_YHIST + 42];
+
+            memcpy(xb, st->acpl_xhist[c][sb], sizeof(st->acpl_xhist[c][sb]));
+            memcpy(yb, st->acpl_yhist[c][sb], sizeof(st->acpl_yhist[c][sb]));
+            for (int ts = 0; ts < num_ts; ts++)
+                xb[ACPL_XHIST + ts] = x[c][ts][sb];
+
+            for (int ts = 0; ts < num_ts; ts++) {
+                const float *xp = xb + ACPL_XHIST + ts - delay;   // x[ts - delay]
+                const float *yp = yb + ACPL_YHIST + ts;           // y[ts]
+                float acc = a[len] * xp[0];                       // b[0] = a[len]
+
+                for (int i = 1; i <= len; i++)
+                    acc += a[len - i] * xp[-i] - a[i] * yp[-i];   // b[i] = a[len - i]
+                yb[ACPL_YHIST + ts] = acc;                        // (a[0] = 1)
+                y[c][ts][sb] = acc;
+            }
+
+            memcpy(st->acpl_xhist[c][sb], xb + num_ts, sizeof(st->acpl_xhist[c][sb]));
+            memcpy(st->acpl_yhist[c][sb], yb + num_ts, sizeof(st->acpl_yhist[c][sb]));
+        }
+    }
+}
+
+/* pseudocode 112-114: the transient ducker, in place, one time slot at a time */
+static void acpl_duck(AC4DecodeContext *s, SubstreamChannel *st, float (*u)[42][64])
+{
+    const float ALPHA = 0.76592833836465f, ALPHA_SMOOTH = 0.25f, GAMMA = 1.5f, EPSILON = 1.0e-9f;
+
+    for (int ts = 0; ts < s->num_qmf_timeslots; ts++) {
+        float energy[15] = { 0 }, gain[15];
+
+        for (int sb = 0; sb < 64; sb++)
+            energy[sb_to_pb(0, sb)] += u[0][ts][sb] * u[0][ts][sb] + u[1][ts][sb] * u[1][ts][sb];
+
+        for (int pb = 0; pb < 15; pb++) {
+            float peak = ALPHA * st->acpl_peak_decay[pb] < energy[pb] ? energy[pb] : ALPHA * st->acpl_peak_decay[pb];
+            float smooth = (1.f - ALPHA_SMOOTH) * st->acpl_smooth[pb] + ALPHA_SMOOTH * energy[pb];
+            float diff = (1.f - ALPHA_SMOOTH) * st->acpl_smooth_peak_diff[pb] + ALPHA_SMOOTH * (peak - energy[pb]);
+
+            gain[pb] = GAMMA * diff > smooth ? smooth / (GAMMA * (diff + EPSILON)) : 1.f;
+            st->acpl_peak_decay[pb] = peak;
+            st->acpl_smooth[pb] = smooth;
+            st->acpl_smooth_peak_diff[pb] = diff;
+        }
+
+        for (int sb = 0; sb < 64; sb++) {
+            const float g = gain[sb_to_pb(0, sb)];
+
+            u[0][ts][sb] *= g;
+            u[1][ts][sb] *= g;
+        }
+    }
+}
+
+/* pseudocode 116 and 117 for one module: front channel f and surround channel r, from the
+ * parameters (and decorrelator d's state) kept in channel f; residual: r carries a residual
+ * signal (ASPX_ACPL_1) */
+static void acpl_module(AC4DecodeContext *s, Substream *ss, int f, int r, int d, int residual)
+{
+    SubstreamChannel *front = &ss->ssch[f], *rear = &ss->ssch[r];
+    const int num_ts = s->num_qmf_timeslots;
+    const int num_pset = front->acpl_num_param_sets_cod + 1;
+    const int qmf_band = ss->acpl_qmf_band;
+    float alpha[2][16], beta[2][16];
+    LOCAL_ALIGNED_32(float, x0, [2], [42][64]);
+    LOCAL_ALIGNED_32(float, y0, [2], [42][64]);
+
+    acpl_dequantize(ss, front, num_pset, alpha, beta);
+
+    for (int c = 0; c < 2; c++)
+        for (int ts = 0; ts < num_ts; ts++)
+            for (int sb = 0; sb < 64; sb++)
+                x0[c][ts][sb] = 2.f * front->Q[c][ts][sb];
+
+    acpl_decorrelate(s, front, d, x0, y0);
+    acpl_duck(s, front, y0);
+
+    for (int sb = 0; sb < 64; sb++) {
+        const int pb = sb_to_pb(ss->acpl_num_param_bands_id, sb);
+
+        for (int ts = 0; ts < num_ts; ts++) {
+            const float a = acpl_interpolate(s, front, num_pset, alpha, front->acpl_alpha_prev, pb, sb, ts);
+            const float b = acpl_interpolate(s, front, num_pset, beta, front->acpl_beta_prev, pb, sb, ts);
+
+            for (int c = 0; c < 2; c++) {
+                const float xf = x0[c][ts][sb];
+                const float xr = residual ? 2.f * rear->Q[c][ts][sb] : 0.f;
+                const float yv = y0[c][ts][sb];
+                float z0, z1;
+
+                if (sb < qmf_band) {
+                    z0 = 0.5f * (xf + xr);
+                    z1 = 0.5f * (xf - xr);
+                } else {
+                    z0 = 0.5f * (xf * (1.f + a) + yv * b);
+                    z1 = 0.5f * (xf * (1.f - a) - yv * b);
+                }
+                front->Q[c][ts][sb] = z0;
+                rear->Q[c][ts][sb]  = z1 * (float)M_SQRT2;
+            }
+        }
+    }
+
+    // pseudocode 110: the last parameter set, per subband, for the next frame's interpolation
+    for (int sb = 0; sb < 64; sb++) {
+        const int pb = sb_to_pb(ss->acpl_num_param_bands_id, sb);
+
+        front->acpl_alpha_prev[sb] = alpha[num_pset - 1][pb];
+        front->acpl_beta_prev[sb]  = beta[num_pset - 1][pb];
+    }
+}
+
+/* clause 5.7.7.6.1: 5_X_codec_mode ASPX_ACPL_1 or ASPX_ACPL_2 - L and R give L,Ls and R,Rs */
+static void acpl_5x_processing(AC4DecodeContext *s, Substream *ss)
+{
+    const int residual = ss->codec_mode == CM_ASPX_ACPL_1;
+
+    acpl_module(s, ss, 0, 3, 0, residual);      // L -> L, Ls with decorrelator D0
+    acpl_module(s, ss, 1, 4, 1, residual);      // R -> R, Rs with decorrelator D1
 }
 
 static void decode_channel(AC4DecodeContext *s, int ch, float *pcm)
@@ -5801,12 +6144,15 @@ static int ac4_decode_frame(AVCodecContext *avctx, void *data,
 
     presentation = FFMIN(s->target_presentation, FFMAX(0, s->nb_presentations - 1));
     ssinfo = s->version == 2 ? &s->ssgroup[0].ssinfo : &s->pinfo[presentation].ssinfo;
-    avctx->sample_rate = s->fs_index ? 48000 : 44100;
+    /* The codec runs at an internal frame length tied to the video frame rate (frame_len_base);
+     * a sample rate converter takes it to the external rate (TS 103 190-1 4.3.3.2.6 and 6.2.15).
+     * Frames are output at that internal rate - external rate / decoder resampling ratio, e.g.
+     * 46034 Hz for 29.97 fps, 51200 Hz for 25 fps - for the caller to resample: played at 48 kHz
+     * they would be 4 % fast (29.97 fps) or 6 % slow (25 fps). */
+    avctx->sample_rate = av_rescale(s->fs_index ? 48000 : 44100,
+                                    s->resampling_ratio.den, s->resampling_ratio.num);
     avctx->channels = channel_mode_nb_channels[ssinfo->channel_mode];
     avctx->channel_layout = channel_mode_layouts[ssinfo->channel_mode];
-    frame->nb_samples = av_rescale(s->frame_len_base,
-                                   s->resampling_ratio.num,
-                                   s->resampling_ratio.den);
     frame->nb_samples = s->frame_len_base;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
@@ -5865,6 +6211,11 @@ static int ac4_decode_frame(AVCodecContext *avctx, void *data,
         break;
     case 3:
     case 4:
+        // (A-SPX first: the A-CPL tool works on its output - TS 103 190-1 5.7.7.1)
+        if (s->aspx_5x)
+            m5channel_aspx_processing(s, &s->substream);
+        if (s->substream.codec_mode == CM_ASPX_ACPL_1 || s->substream.codec_mode == CM_ASPX_ACPL_2)
+            acpl_5x_processing(s, &s->substream);
         break;
     }
 
@@ -5918,6 +6269,7 @@ static av_cold int ac4_decode_end(AVCodecContext *avctx)
 
 static const AVOption options[] = {
     { "presentation", "select presentation", OFFSET(target_presentation), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, INT_MAX, FLAGS },
+    { "aspx_5x", "apply A-SPX in 5.x channel elements", OFFSET(aspx_5x), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, FLAGS },
     { NULL},
 };
 
