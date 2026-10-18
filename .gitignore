@@ -40,3 +40,5 @@
 # (this repository)
 ffmpeg-ac4.zip
 *.orig
+# the ETSI AC-4 specifications (ETSI documents: downloaded for reference, not redistributed)
+/doc/ETSI/
