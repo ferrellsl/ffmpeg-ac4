@@ -21,6 +21,20 @@ the FFmpeg 6.0.1 tree it comes from is the branch
 of this repository. Both decode the same (see "Changes in this repository"
 below).
 
+## Support
+
+This is shared as-is, for anyone it's useful to. I can't help with building
+FFmpeg, or with installing or configuring Kodi, PVR back ends (such as
+NextPVR), tuners, skins or add-ons: for those, please use the
+[Kodi forum](https://forum.kodi.tv/) or the
+[NextPVR forum](https://forums.nextpvr.com/). This isn't an official FFmpeg
+or Kodi release, so please don't report problems with it to either project.
+
+Problems with **AC-4 decoding itself** (no sound, wrong channels, distortion
+on a stream that plays fine elsewhere) are welcome as
+[GitHub issues](https://github.com/ferrellsl/ffmpeg-ac4/issues): say what the
+stream is, and attach a short sample if you can.
+
 ## What it decodes
 
 - Mono, stereo and 5.1 AC-4 (the forms broadcasters mostly use), and 7.1.
