@@ -15,6 +15,20 @@ released). `master` (FFmpeg 4.3) has the same decoder and decodes the same;
 its README describes the decoder in full: what it decodes, how it was checked
 against Dolby's own decode, its limitations, and every change made to it.
 
+## Support
+
+This is shared as-is, for anyone it's useful to. I can't help with building
+FFmpeg, or with installing or configuring Kodi, PVR back ends (such as
+NextPVR), tuners, skins or add-ons: for those, please use the
+[Kodi forum](https://forum.kodi.tv/) or the
+[NextPVR forum](https://forums.nextpvr.com/). This isn't an official FFmpeg
+or Kodi release, so please don't report problems with it to either project.
+
+Problems with **AC-4 decoding itself** (no sound, wrong channels, distortion
+on a stream that plays fine elsewhere) are welcome as
+[GitHub issues](https://github.com/ferrellsl/ffmpeg-ac4/issues): say what the
+stream is, and attach a short sample if you can.
+
 ## In short
 
 - Mono, stereo and 5.1 AC-4, including 5.1 with parametric surrounds (A-CPL,
