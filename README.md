@@ -8,6 +8,8 @@ broadcasts, some DVB services and streaming. The decoder,
 
 It is the FFmpeg behind a Kodi build that plays AC-4 sound.
 
+**New: 5.1.4 Atmos broadcasts now play as 5.1** on the [`ffmpeg-6.0.1`](https://github.com/ferrellsl/ffmpeg-ac4/tree/ffmpeg-6.0.1) branch, in the [Kodi builds](https://github.com/ferrellsl/kodi-ac4/releases/latest). This older FFmpeg 4.3 tree rejects such streams with an error.
+
 ## Kodi 21.3 and FFmpeg 6.0.1
 
 The decoder has been ported to FFmpeg 6.0.1, the FFmpeg that Kodi 21.3
