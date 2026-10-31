@@ -69,8 +69,8 @@ its 29.97 fps version lasts as long as the reference.
   found in ATSC 3.0 broadcasts and Dolby's test material). ASPX_ACPL_3 and
   A-CPL in 7.x elements are not done yet: no test material uses them so far.
 - **Immersive AC-4 (IMS, A-JOC / Atmos, and 5.1.4 and other channel
-  configurations with height channels) is not supported**: such frames are
-  rejected as invalid data.
+  configurations with height channels) is not supported here**: such frames
+  are rejected with an error. 5.1.4 is decoded on the `ffmpeg-6.0.1` branch.
 
 ## Changes in this repository
 

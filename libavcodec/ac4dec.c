@@ -1231,7 +1231,8 @@ static int ac4_substream_group_info(AC4DecodeContext *s,
     } else {
         if (get_bits1(gb))
             oamd_substream_info(s, g, substreams_present);
-        av_assert0(0);
+        avpriv_request_sample(s->avctx, "object audio");
+        return AVERROR_PATCHWELCOME;
       /*for (int sus = 0; sus < n_lf_substreams; sus++) {
             if (get_bits1(gb)) {
                 ac4_substream_info_ajoc(substreams_present);
@@ -4205,8 +4206,8 @@ static int audio_data(AC4DecodeContext *s, int channel_mode, int iframe)
         ret = channel_element_7x(s, channel_mode, iframe);
         break;
     default:
-        av_assert0(0);
-        break;
+        avpriv_request_sample(s->avctx, "channel mode %d", channel_mode);
+        return AVERROR_PATCHWELCOME;
     }
 
     return ret;
@@ -6151,6 +6152,12 @@ static int ac4_decode_frame(AVCodecContext *avctx, void *data,
      * they would be 4 % fast (29.97 fps) or 6 % slow (25 fps). */
     avctx->sample_rate = av_rescale(s->fs_index ? 48000 : 44100,
                                     s->resampling_ratio.den, s->resampling_ratio.num);
+    if (ssinfo->channel_mode >= FF_ARRAY_ELEMS(channel_mode_layouts) ||
+        !channel_mode_layouts[ssinfo->channel_mode]) {
+        /* immersive (7.X.4 and up): supported on the ffmpeg-6.0.1 branch */
+        av_log(s->avctx, AV_LOG_ERROR, "unsupported channel mode: %d\n", ssinfo->channel_mode);
+        return AVERROR_PATCHWELCOME;
+    }
     avctx->channels = channel_mode_nb_channels[ssinfo->channel_mode];
     avctx->channel_layout = channel_mode_layouts[ssinfo->channel_mode];
     frame->nb_samples = s->frame_len_base;
