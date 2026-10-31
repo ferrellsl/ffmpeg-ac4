@@ -302,11 +302,12 @@ typedef struct Substream {
 
     uint8_t compand_on[5];
     int     compand_avg;
+    int     compand_sync;
 
     int     max_sfb_master;
 
     uint8_t coding_config;
-    uint8_t mdct_stereo_proc[2];
+    uint8_t mdct_stereo_proc[3];
     float   matrix_stereo[16][128][2][2];
     float   alpha_q[16][128];
 
@@ -315,7 +316,33 @@ typedef struct Substream {
     int     spec_frontend_m;
     int     spec_frontend_s;
 
-    SubstreamChannel ssch[9];
+    /* immersive_channel_element: the core tracks are in ssch[0..4] (A-E) and for ASPX_ACPL_x
+     * ssch[7..8] (F, G); A-CPL and A-JCC leave the output channels in ssch[] by speaker index
+     * (TS 103 190-2 table A.27): L R C Ls Rs Lb Rb Tfl Tfr Tbl Tbr LFE */
+    int     immersive_codec_mode;
+    uint8_t use_sap_add_ch;
+    uint8_t ajcc_no_dt;
+    uint8_t ajcc_num_param_bands_id;
+    int     ajcc_core_mode;
+    int     ajcc_core_mode_prev;        ///< -1 until the first frame
+    uint8_t ajcc_qm_ab;
+    uint8_t ajcc_qm_dw;
+    uint8_t ajcc_interpolation_type[2]; ///< left, right
+    uint8_t ajcc_nps[2];
+    uint8_t ajcc_param_timeslot[2][2];
+    int     ajcc_data[14][2][15];       ///< Huffman-decoded values by AJCC_* set and parameter set
+    uint8_t ajcc_diff_type[14][2];
+    int     ajcc_q_prev[14][15];        ///< last quantized parameter set, for DIFF_TIME
+    float   ajcc_param_prev[2][25][64]; ///< d0-d9, w0-w14 per subband at the end of the last frame
+
+    float   matrix_mc[5][16][128][2][2]; ///< chparam_info() parameters of a 3-, 4- or 5-channel data
+
+    DECLARE_ALIGNED(32, float, ajcc_x)[5][2][42][64];
+    DECLARE_ALIGNED(32, float, ajcc_w)[2][2][42][64];
+    DECLARE_ALIGNED(32, float, ajcc_y)[6][2][42][64];
+    DECLARE_ALIGNED(32, float, ajcc_z)[5][2][42][64];
+
+    SubstreamChannel ssch[12];
 } Substream;
 
 typedef struct PresentationSubstreamInfo {
@@ -418,6 +445,8 @@ typedef struct AC4DecodeContext {
 
     int             target_presentation;
     int             aspx_5x;                 ///< apply A-SPX in 5.x elements (option, for comparison)
+    int             immersive_output;        ///< IMMERSIVE_OUT_*
+    int             companding;              ///< companding tool in ASPX_AJCC elements (option)
 
     int             version;
     int             sequence_counter;
@@ -463,7 +492,31 @@ typedef struct AC4DecodeContext {
     PresentationInfo   pinfo[8];
     SubstreamGroupInfo ssgroup[8];
     Substream          substream;
+
+    DECLARE_ALIGNED(32, float, render_pcm)[12][2048];
 } AC4DecodeContext;
+
+enum ImmersiveCodecMode {
+    ICM_SCPL,
+    ICM_ASPX_SCPL,
+    ICM_ASPX_ACPL_1,
+    ICM_ASPX_ACPL_2,
+    ICM_ASPX_AJCC,
+};
+
+enum ImmersiveOutput {
+    IMMERSIVE_OUT_5_1,      ///< render to 5.1 (TS 103 190-2 table 43)
+    IMMERSIVE_OUT_7_1,      ///< render to 7.1 (table 40)
+    IMMERSIVE_OUT_TOP,      ///< the decoded channels: 5.1.4 or 7.1.4
+};
+
+/* parameter sets of ajcc_data() */
+enum AJCCSet {
+    AJCC_ALPHA1, AJCC_ALPHA2,
+    AJCC_BETA1,  AJCC_BETA2,
+    AJCC_DRY1, AJCC_DRY2, AJCC_DRY3, AJCC_DRY4,
+    AJCC_WET1, AJCC_WET2, AJCC_WET3, AJCC_WET4, AJCC_WET5, AJCC_WET6,
+};
 
 enum StrideFlag {
     LONG_STRIDE,
@@ -580,6 +633,7 @@ static VLC scale_factors_vlc;
 static VLC snf_vlc;
 static VLC asf_codebook_vlc[11];
 static VLC acpl_codebook_vlc[4][2][3];
+static VLC ajcc_codebook_vlc[2][2][3];
 static VLC aspx_int_class_vlc;
 static VLC aspx_codebook_signal_vlc[2][2][3];
 static VLC aspx_codebook_noise_vlc[2][3];
@@ -673,6 +727,31 @@ static av_cold int ac4_decode_init(AVCodecContext *avctx)
     INIT_VLC_STATIC(&aspx_codebook_noise_vlc[1][2], 9, sizeof(aspx_hcb_noise_balance_dt_bits),
                     aspx_hcb_noise_balance_dt_bits, 1, 1, aspx_hcb_noise_balance_dt_codes, 2, 2, 530);
 
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[0][0][0], 9, sizeof(ajcc_hcb_dry_fine_f0_bits),
+                    ajcc_hcb_dry_fine_f0_bits, 1, 1, ajcc_hcb_dry_fine_f0_codes, 4, 4, 522);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[0][0][1], 9, sizeof(ajcc_hcb_dry_fine_df_bits),
+                    ajcc_hcb_dry_fine_df_bits, 1, 1, ajcc_hcb_dry_fine_df_codes, 4, 4, 1542);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[0][0][2], 9, sizeof(ajcc_hcb_dry_fine_dt_bits),
+                    ajcc_hcb_dry_fine_dt_bits, 1, 1, ajcc_hcb_dry_fine_dt_codes, 4, 4, 1044);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[0][1][0], 9, sizeof(ajcc_hcb_dry_coarse_f0_bits),
+                    ajcc_hcb_dry_coarse_f0_bits, 1, 1, ajcc_hcb_dry_coarse_f0_codes, 4, 4, 514);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[0][1][1], 9, sizeof(ajcc_hcb_dry_coarse_df_bits),
+                    ajcc_hcb_dry_coarse_df_bits, 1, 1, ajcc_hcb_dry_coarse_df_codes, 4, 4, 1026);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[0][1][2], 9, sizeof(ajcc_hcb_dry_coarse_dt_bits),
+                    ajcc_hcb_dry_coarse_dt_bits, 1, 1, ajcc_hcb_dry_coarse_dt_codes, 4, 4, 768);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[1][0][0], 9, sizeof(ajcc_hcb_wet_fine_f0_bits),
+                    ajcc_hcb_wet_fine_f0_bits, 1, 1, ajcc_hcb_wet_fine_f0_codes, 4, 4, 836);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[1][0][1], 9, sizeof(ajcc_hcb_wet_fine_df_bits),
+                    ajcc_hcb_wet_fine_df_bits, 1, 1, ajcc_hcb_wet_fine_df_codes, 4, 4, 1612);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[1][0][2], 9, sizeof(ajcc_hcb_wet_fine_dt_bits),
+                    ajcc_hcb_wet_fine_dt_bits, 1, 1, ajcc_hcb_wet_fine_dt_codes, 4, 4, 1578);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[1][1][0], 9, sizeof(ajcc_hcb_wet_coarse_f0_bits),
+                    ajcc_hcb_wet_coarse_f0_bits, 1, 1, ajcc_hcb_wet_coarse_f0_codes, 4, 4, 642);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[1][1][1], 9, sizeof(ajcc_hcb_wet_coarse_df_bits),
+                    ajcc_hcb_wet_coarse_df_bits, 1, 1, ajcc_hcb_wet_coarse_df_codes, 4, 4, 1044);
+    INIT_VLC_STATIC(&ajcc_codebook_vlc[1][1][2], 9, sizeof(ajcc_hcb_wet_coarse_dt_bits),
+                    ajcc_hcb_wet_coarse_dt_bits, 1, 1, ajcc_hcb_wet_coarse_dt_codes, 4, 4, 770);
+
     INIT_VLC_STATIC(&acpl_codebook_vlc[0][1][0], 9, sizeof(acpl_hcb_alpha_coarse_f0_bits),
                     acpl_hcb_alpha_coarse_f0_bits, 1, 1, acpl_hcb_alpha_coarse_f0_codes, 2, 2, 516);
     INIT_VLC_STATIC(&acpl_codebook_vlc[0][1][1], 9, sizeof(acpl_hcb_alpha_coarse_df_bits),
@@ -755,6 +834,8 @@ static av_cold int ac4_decode_init(AVCodecContext *avctx)
             s->sin_stab[n][i] = sinf(M_PI/128*(i+0.5)*(2*n-255)) / 64.f;
         }
     }
+
+    s->substream.ajcc_core_mode_prev = -1;
 
     s->fdsp = avpriv_float_dsp_alloc(avctx->flags & AV_CODEC_FLAG_BITEXACT);
     if (!s->fdsp)
@@ -1234,7 +1315,8 @@ static int ac4_substream_group_info(AC4DecodeContext *s,
     } else {
         if (get_bits1(gb))
             oamd_substream_info(s, g, substreams_present);
-        av_assert0(0);
+        avpriv_request_sample(s->avctx, "object audio");
+        return AVERROR_PATCHWELCOME;
       /*for (int sus = 0; sus < n_lf_substreams; sus++) {
             if (get_bits1(gb)) {
                 ac4_substream_info_ajoc(substreams_present);
@@ -2655,6 +2737,8 @@ static int companding_control(AC4DecodeContext *s, Substream *ss, int num_chan)
     if (num_chan > 1)
         sync_flag = get_bits1(gb);
 
+    ss->compand_sync = sync_flag;
+    ss->compand_avg = 0;
     nc = sync_flag ? 1 : num_chan;
 
     for (int i = 0; i < nc; i++) {
@@ -2665,6 +2749,7 @@ static int companding_control(AC4DecodeContext *s, Substream *ss, int num_chan)
 
     if (need_avg == 1)
         ss->compand_avg = get_bits1(gb);
+    av_log(s->avctx, AV_LOG_DEBUG, "companding: sync %d on %d avg %d\n", sync_flag, ss->compand_on[0], ss->compand_avg);
 
     return 0;
 }
@@ -3702,27 +3787,34 @@ static int channel_pair_element(AC4DecodeContext *s, int iframe)
     return 0;
 }
 
-static int four_channel_data(AC4DecodeContext *s, Substream *ss, int iframe)
+static int four_channel_data(AC4DecodeContext *s, Substream *ss, const uint8_t *tracks, int iframe)
 {
+    SubstreamChannel *ssch0 = &ss->ssch[tracks[0]];
     int ret;
 
-    ret = sf_info(s, ss, &ss->ssch[0], SF_ASF, 0, 0);
+    ret = sf_info(s, ss, ssch0, SF_ASF, 0, 0);
     if (ret < 0)
         return ret;
 
     for (int i = 1; i < 4; i++) {
-        memcpy(&ss->ssch[i], &ss->ssch[0], sizeof(ss->ssch[0]));
+        SubstreamChannel *ssch = &ss->ssch[tracks[i]];
+
+        memcpy(&ssch->scp, &ssch0->scp, sizeof(ssch0->scp));
+        memcpy(&ssch->sect_sfb_offset, &ssch0->sect_sfb_offset, sizeof(ssch0->sect_sfb_offset));
+        memcpy(&ssch->offset2sfb, &ssch0->offset2sfb, sizeof(ssch0->offset2sfb));
+        memcpy(&ssch->offset2g, &ssch0->offset2g, sizeof(ssch0->offset2g));
+        memcpy(&ssch->win_offset, &ssch0->win_offset, sizeof(ssch0->win_offset));
     }
 
     for (int i = 0; i < 4; i++) {
-        ret = chparam_info(s, ss, &ss->ssch[i]);
+        ret = chparam_info(s, ss, &ss->ssch[tracks[i]]);
         if (ret < 0)
             return ret;
     }
 
     for (int i = 0; i < 4; i++) {
         av_log(s->avctx, AV_LOG_DEBUG, "channel: %d/4\n", i);
-        ret = sf_data(s, ss, &ss->ssch[i], iframe, SF_ASF);
+        ret = sf_data(s, ss, &ss->ssch[tracks[i]], iframe, SF_ASF);
         if (ret < 0)
             return ret;
     }
@@ -3812,6 +3904,9 @@ static int mono_data(AC4DecodeContext *s, Substream *ss,
     return sf_data(s, ss, ssch, iframe, spec_frontend);
 }
 
+static const uint8_t tracks_0123[4] = { 0, 1, 2, 3 };
+static const uint8_t acpl_fronts[4] = { 3, 4, 7, 8 };   // Ls, Rs, Tfl, Tfr
+
 static int channel_element_7x(AC4DecodeContext *s, int channel_mode, int iframe)
 {
     GetBitContext *gb = &s->gbc;
@@ -3846,7 +3941,7 @@ static int channel_element_7x(AC4DecodeContext *s, int channel_mode, int iframe)
     case 1:
         break;
     case 2:
-        ret = four_channel_data(s, ss, iframe);
+        ret = four_channel_data(s, ss, tracks_0123, iframe);
         break;
     case 3:
         ret = five_channel_data(s, ss, iframe);
@@ -4064,7 +4159,7 @@ static int channel_element_5x(AC4DecodeContext *s, int lfe, int iframe)
                 return ret;
             break;
         case 2:
-            ret = four_channel_data(s, ss, iframe);
+            ret = four_channel_data(s, ss, tracks_0123, iframe);
             if (ret < 0)
                 return ret;
             ret = mono_data(s, ss, &ss->ssch[4], 0, iframe);
@@ -4155,6 +4250,209 @@ static int channel_element_5x(AC4DecodeContext *s, int lfe, int iframe)
     return ret;
 }
 
+/* TS 103 190-2 clauses 6.2.6.2-6.2.6.4 */
+static int ajcc_framing_data(AC4DecodeContext *s, Substream *ss, int side)
+{
+    GetBitContext *gb = &s->gbc;
+
+    ss->ajcc_interpolation_type[side] = get_bits1(gb);
+    ss->ajcc_nps[side] = get_bits1(gb) + 1;
+    if (ss->ajcc_interpolation_type[side])
+        for (int ps = 0; ps < ss->ajcc_nps[side]; ps++)
+            ss->ajcc_param_timeslot[side][ps] = get_bits(gb, 5);
+
+    return 0;
+}
+
+static int ajcc_huff_data(AC4DecodeContext *s, Substream *ss, int set, int quant_mode, int ps)
+{
+    static const uint8_t ajcc_cb_off[2][2][3] = {
+        { { 0, 22, 22 }, { 0, 11, 11 } },
+        { { 0, 40, 40 }, { 0, 20, 20 } },
+    };
+    GetBitContext *gb = &s->gbc;
+    const int bands = acpl_num_param_bands[ss->ajcc_num_param_bands_id];
+    int *data = ss->ajcc_data[set][ps];
+    const int acpl = set < AJCC_DRY1;       // alpha and beta use the A-CPL codebooks
+    const int dtype = acpl ? set >= AJCC_BETA1 : set >= AJCC_WET1;
+    const int diff_type = ss->ajcc_no_dt ? 0 : get_bits1(gb);
+
+    ss->ajcc_diff_type[set][ps] = diff_type;
+    for (int i = 0; i < bands; i++) {
+        const int hcb = diff_type ? DT : !i ? F0 : DF;
+        VLC *cb = acpl ? get_acpl_hcb(dtype, quant_mode, hcb) : &ajcc_codebook_vlc[dtype][quant_mode][hcb];
+
+        data[i] = get_vlc2(gb, cb->table, cb->bits, 3);
+        if (data[i] < 0) {
+            av_log(s->avctx, AV_LOG_ERROR, "invalid A-JCC Huffman code\n");
+            return AVERROR_INVALIDDATA;
+        }
+        data[i] -= acpl ? acpl_cb_off[dtype][quant_mode][hcb] : ajcc_cb_off[dtype][quant_mode][hcb];
+    }
+
+    return 0;
+}
+
+static int ajced(AC4DecodeContext *s, Substream *ss, int set, int quant_mode, int num_ps)
+{
+    for (int ps = 0; ps < num_ps; ps++) {
+        int ret = ajcc_huff_data(s, ss, set, quant_mode, ps);
+
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+/* TS 103 190-2 clause 6.2.6.1, b_5fronts = 0 */
+static int ajcc_data(AC4DecodeContext *s, Substream *ss)
+{
+    GetBitContext *gb = &s->gbc;
+    int ret;
+
+    ss->ajcc_no_dt = get_bits1(gb);
+    ss->ajcc_num_param_bands_id = get_bits(gb, 2);
+    ss->ajcc_core_mode = get_bits1(gb);
+    ss->ajcc_qm_ab = get_bits1(gb);
+    ss->ajcc_qm_dw = get_bits1(gb);
+    ajcc_framing_data(s, ss, 0);
+    ajcc_framing_data(s, ss, 1);
+
+    if ((ret = ajced(s, ss, AJCC_ALPHA1, ss->ajcc_qm_ab, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_ALPHA2, ss->ajcc_qm_ab, ss->ajcc_nps[1])) < 0 ||
+        (ret = ajced(s, ss, AJCC_BETA1,  ss->ajcc_qm_ab, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_BETA2,  ss->ajcc_qm_ab, ss->ajcc_nps[1])) < 0 ||
+        (ret = ajced(s, ss, AJCC_DRY1,   ss->ajcc_qm_dw, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_DRY2,   ss->ajcc_qm_dw, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_DRY3,   ss->ajcc_qm_dw, ss->ajcc_nps[1])) < 0 ||
+        (ret = ajced(s, ss, AJCC_DRY4,   ss->ajcc_qm_dw, ss->ajcc_nps[1])) < 0 ||
+        (ret = ajced(s, ss, AJCC_WET1,   ss->ajcc_qm_dw, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_WET2,   ss->ajcc_qm_dw, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_WET3,   ss->ajcc_qm_dw, ss->ajcc_nps[0])) < 0 ||
+        (ret = ajced(s, ss, AJCC_WET4,   ss->ajcc_qm_dw, ss->ajcc_nps[1])) < 0 ||
+        (ret = ajced(s, ss, AJCC_WET5,   ss->ajcc_qm_dw, ss->ajcc_nps[1])) < 0 ||
+        (ret = ajced(s, ss, AJCC_WET6,   ss->ajcc_qm_dw, ss->ajcc_nps[1])) < 0)
+        return ret;
+
+    return 0;
+}
+
+/* TS 103 190-2 clause 6.2.4.1 with b_5fronts = 0, 7.0.4 and 7.1.4 (5.X.4 is these with Lb, Rb
+ * silent); immersive_codec_mode ASPX_ACPL_2, which broadcasts and Dolby's test streams use, and
+ * ASPX_AJCC */
+static int immersive_channel_element(AC4DecodeContext *s, int lfe, int iframe)
+{
+    static const uint8_t tracks_abde[4] = { 0, 1, 3, 4 };
+    GetBitContext *gb = &s->gbc;
+    Substream *ss = &s->substream;
+    int ajcc, ret = 0;
+
+    ss->immersive_codec_mode = get_bits1(gb) ? ICM_ASPX_AJCC : get_bits(gb, 2);
+    av_log(s->avctx, AV_LOG_DEBUG, "immersive_codec_mode: %d\n", ss->immersive_codec_mode);
+    if (ss->immersive_codec_mode != ICM_ASPX_AJCC &&
+        ss->immersive_codec_mode != ICM_ASPX_ACPL_2) {
+        avpriv_request_sample(s->avctx, "immersive_codec_mode %d", ss->immersive_codec_mode);
+        return AVERROR_PATCHWELCOME;
+    }
+    ajcc = ss->immersive_codec_mode == ICM_ASPX_AJCC;
+
+    if (iframe) {
+        aspx_config(s, ss);
+        if (!ajcc)
+            acpl_config_1ch(s, ss, ACPL_FULL);
+    }
+
+    if (lfe) {
+        ret = mono_data(s, ss, &ss->ssch[11], 1, iframe);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (ajcc)
+        companding_control(s, ss, 5);
+
+    memset(ss->mdct_stereo_proc, 0, sizeof(ss->mdct_stereo_proc));
+    ss->coding_config = get_bits(gb, 2);        // core_5ch_grouping
+    av_log(s->avctx, AV_LOG_DEBUG, "core_5ch_grouping: %d\n", ss->coding_config);
+    switch (ss->coding_config) {
+    case 0:
+        ss->mode_2ch = get_bits1(gb);
+        av_log(s->avctx, AV_LOG_DEBUG, "2ch_mode: %d\n", ss->mode_2ch);
+        ret = two_channel_data(s, ss, &ss->ssch[0], &ss->ssch[ss->mode_2ch ? 3 : 1], 0);
+        if (ret < 0)
+            return ret;
+        ret = two_channel_data(s, ss, &ss->ssch[ss->mode_2ch ? 1 : 3], &ss->ssch[4], 1);
+        if (ret < 0)
+            return ret;
+        ret = mono_data(s, ss, &ss->ssch[2], 0, iframe);
+        break;
+    case 1:
+        ret = three_channel_data(s, ss, &ss->ssch[0], &ss->ssch[1], &ss->ssch[2]);
+        if (ret < 0)
+            return ret;
+        ret = two_channel_data(s, ss, &ss->ssch[3], &ss->ssch[4], 0);
+        break;
+    case 2:
+        ret = four_channel_data(s, ss, tracks_abde, iframe);
+        if (ret < 0)
+            return ret;
+        ret = mono_data(s, ss, &ss->ssch[2], 0, iframe);
+        break;
+    case 3:
+        ret = five_channel_data(s, ss, iframe);
+        break;
+    }
+    if (ret < 0)
+        return ret;
+
+    if (!ajcc) {
+        // the two channels of the 5.X.2 core beyond the 5.X.0 one; the extra chparam_info()s sit
+        // in unused tracks, 5.2.3.3 has no use for them
+        ss->use_sap_add_ch = get_bits1(gb);
+        av_log(s->avctx, AV_LOG_DEBUG, "b_use_sap_add_ch: %d\n", ss->use_sap_add_ch);
+        if (ss->use_sap_add_ch) {
+            for (int i = 0; i < 2; i++) {
+                SubstreamChannel *ssch = &ss->ssch[5 + i];
+
+                memcpy(&ssch->scp, &ss->ssch[3 + i].scp, sizeof(ssch->scp));
+                ret = chparam_info(s, ss, ssch);
+                if (ret < 0)
+                    return ret;
+            }
+        }
+        ret = two_channel_data(s, ss, &ss->ssch[7], &ss->ssch[8], 2);
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = aspx_data_2ch(s, ss, &ss->ssch[0], &ss->ssch[1], iframe);
+    if (ret < 0)
+        return ret;
+    ret = aspx_data_2ch(s, ss, &ss->ssch[3], &ss->ssch[4], iframe);
+    if (ret < 0)
+        return ret;
+    if (!ajcc) {
+        ret = aspx_data_2ch(s, ss, &ss->ssch[7], &ss->ssch[8], iframe);
+        if (ret < 0)
+            return ret;
+    }
+    ret = aspx_data_1ch(s, ss, &ss->ssch[2], iframe);
+    if (ret < 0)
+        return ret;
+
+    if (ajcc)
+        return ajcc_data(s, ss);
+
+    for (int i = 0; i < 4; i++) {
+        ret = acpl_data_1ch(s, ss, &ss->ssch[acpl_fronts[i]]);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
 static int single_channel_element(AC4DecodeContext *s, int iframe)
 {
     GetBitContext *gb = &s->gbc;
@@ -4207,9 +4505,15 @@ static int audio_data(AC4DecodeContext *s, int channel_mode, int iframe)
     case 6:
         ret = channel_element_7x(s, channel_mode, iframe);
         break;
-    default:
-        av_assert0(0);
+    case 11:
+        ret = immersive_channel_element(s, 0, iframe);
         break;
+    case 12:
+        ret = immersive_channel_element(s, 1, iframe);
+        break;
+    default:
+        av_log(s->avctx, AV_LOG_ERROR, "unsupported channel mode: %d\n", channel_mode);
+        return AVERROR_PATCHWELCOME;
     }
 
     return ret;
@@ -4559,9 +4863,9 @@ static void scale_spec(AC4DecodeContext *s, int ch)
     }
 }
 
-static int two_channel_processing(AC4DecodeContext *s, Substream *ss,
-                                  SubstreamChannel *ssch0,
-                                  SubstreamChannel *ssch1)
+/* the a, b, c, d parameters of one chparam_info() by window group and scale factor band */
+static void chparam_matrix(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch0,
+                           float (*matrix)[128][2][2])
 {
     int max_sfb_prev;
     float sap_gain;
@@ -4621,11 +4925,18 @@ static int two_channel_processing(AC4DecodeContext *s, Substream *ss,
                 }
             }
 
-            memcpy(&ss->matrix_stereo[g][sfb], m, sizeof(m));
+            memcpy(&matrix[g][sfb], m, sizeof(m));
         }
 
         max_sfb_prev = max_sfb_g;
     }
+}
+
+static int two_channel_processing(AC4DecodeContext *s, Substream *ss,
+                                  SubstreamChannel *ssch0,
+                                  SubstreamChannel *ssch1)
+{
+    chparam_matrix(s, ss, ssch0, ss->matrix_stereo);
 
     for (int k = 0; k < s->frame_len_base; k++) {
         int sfb = ssch0->offset2sfb[k];
@@ -4682,6 +4993,146 @@ static int m5channel_processing(AC4DecodeContext *s, Substream *ss)
     }
 
     return 0;
+}
+
+/* TS 103 190-1 tables 178 and 179: the three-channel transform by chel_matsel, as products of
+ * two of m1 (one), the a, b, c, d of the two chparam_info()s; m0: no term */
+enum { m0, m1, ma0, mb0, mc0, md0, ma1, mb1, mc1, md1 };
+static const uint8_t chel_matrix[12][3][3][2] = {
+    { { {ma0,ma1}, {mb0,ma1}, {mb1,m1} }, { {mc0,m1}, {md0,m1}, {m0,m0} }, { {ma0,mc1}, {mb0,mc1}, {md1,m1} } },
+    { { {md0,m1}, {mc0,m1}, {m0,m0} }, { {mb0,ma1}, {ma0,ma1}, {mb1,m1} }, { {mb0,mc1}, {ma0,mc1}, {md1,m1} } },
+    { { {ma0,ma1}, {mb1,m1}, {mb0,ma1} }, { {ma0,mc1}, {md1,m1}, {mb0,mc1} }, { {mc0,m1}, {m0,m0}, {md0,m1} } },
+    { { {ma1,m1}, {mc0,mb1}, {md0,mb1} }, { {m0,m0}, {ma0,m1}, {mb0,m1} }, { {mc1,m1}, {mc0,md1}, {md0,md1} } },
+    { { {ma0,m1}, {m0,m0}, {mb0,m1} }, { {mc0,mb1}, {ma1,m1}, {md0,mb1} }, { {mc0,md1}, {mc1,m1}, {md0,md1} } },
+    { { {ma1,m1}, {md0,mb1}, {mc0,mb1} }, { {mc1,m1}, {md0,md1}, {mc0,md1} }, { {m0,m0}, {mb0,m1}, {ma0,m1} } },
+    { { {md0,md1}, {mc0,md1}, {mc1,m1} }, { {mb0,m1}, {ma0,m1}, {m0,m0} }, { {md0,mb1}, {mc0,mb1}, {ma1,m1} } },
+    { { {ma0,m1}, {mb0,m1}, {m0,m0} }, { {mc0,md1}, {md0,md1}, {mc1,m1} }, { {mc0,mb1}, {md0,mb1}, {ma1,m1} } },
+    { { {md0,md1}, {mc1,m1}, {mc0,md1} }, { {md0,mb1}, {ma1,m1}, {mc0,mb1} }, { {mb0,m1}, {m0,m0}, {ma0,m1} } },
+    { { {md1,m1}, {mb0,mc1}, {ma0,mc1} }, { {m0,m0}, {md0,m1}, {mc0,m1} }, { {mb1,m1}, {mb0,ma1}, {ma0,ma1} } },
+    { { {md0,m1}, {m0,m0}, {mc0,m1} }, { {mb0,mc1}, {md1,m1}, {ma0,mc1} }, { {mb0,ma1}, {mb1,m1}, {ma0,ma1} } },
+    { { {md1,m1}, {ma0,mc1}, {mb0,mc1} }, { {mb1,m1}, {ma0,ma1}, {mb0,ma1} }, { {m0,m0}, {mc0,m1}, {md0,m1} } },
+};
+
+static void chel_matrix_3(int matsel, float (*const m[2])[2], float out[3][3])
+{
+    float v[10] = { 0.f, 1.f, m[0][0][0], m[0][0][1], m[0][1][0], m[0][1][1],
+                              m[1][0][0], m[1][0][1], m[1][1][0], m[1][1][1] };
+
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            out[i][j] = v[chel_matrix[matsel][i][j][0]] * v[chel_matrix[matsel][i][j][1]];
+}
+
+/* TS 103 190-1 clause 5.3.3.3: the tracks of a three_channel_data() */
+static void three_channel_processing(AC4DecodeContext *s, Substream *ss, int t0, int t1, int t2)
+{
+    SubstreamChannel *c[3] = { &ss->ssch[t0], &ss->ssch[t1], &ss->ssch[t2] };
+
+    if (ss->chel_matsel >= FF_ARRAY_ELEMS(chel_matrix))
+        return;
+
+    for (int i = 0; i < 2; i++)
+        chparam_matrix(s, ss, c[i], ss->matrix_mc[i]);
+
+    for (int k = 0; k < s->frame_len_base; k++) {
+        const int sfb = c[0]->offset2sfb[k], g = c[0]->offset2g[k];
+        float (*const m[2])[2] = { ss->matrix_mc[0][g][sfb], ss->matrix_mc[1][g][sfb] };
+        float in[3] = { c[0]->scaled_spec[k], c[1]->scaled_spec[k], c[2]->scaled_spec[k] };
+        float M[3][3];
+
+        chel_matrix_3(ss->chel_matsel, m, M);
+        for (int i = 0; i < 3; i++)
+            c[i]->scaled_spec[k] = M[i][0] * in[0] + M[i][1] * in[1] + M[i][2] * in[2];
+    }
+}
+
+/* TS 103 190-1 clause 5.3.3.4 */
+static void four_channel_processing(AC4DecodeContext *s, Substream *ss, const uint8_t *tracks)
+{
+    SubstreamChannel *c[4] = { &ss->ssch[tracks[0]], &ss->ssch[tracks[1]],
+                               &ss->ssch[tracks[2]], &ss->ssch[tracks[3]] };
+
+    for (int i = 0; i < 4; i++)
+        chparam_matrix(s, ss, c[i], ss->matrix_mc[i]);
+
+    for (int k = 0; k < s->frame_len_base; k++) {
+        const int sfb = c[0]->offset2sfb[k], g = c[0]->offset2g[k];
+        float in[4] = { c[0]->scaled_spec[k], c[1]->scaled_spec[k], c[2]->scaled_spec[k], c[3]->scaled_spec[k] };
+        float (*p0)[2] = ss->matrix_mc[0][g][sfb], (*p1)[2] = ss->matrix_mc[1][g][sfb];
+        float (*p2)[2] = ss->matrix_mc[2][g][sfb], (*p3)[2] = ss->matrix_mc[3][g][sfb];
+        float x0 = p0[0][0] * in[0] + p0[0][1] * in[1];
+        float x1 = p0[1][0] * in[0] + p0[1][1] * in[1];
+        float y0 = p1[0][0] * in[2] + p1[0][1] * in[3];
+        float y1 = p1[1][0] * in[2] + p1[1][1] * in[3];
+
+        c[0]->scaled_spec[k] = p2[0][0] * x0 + p2[0][1] * y0;
+        c[1]->scaled_spec[k] = p3[0][0] * x1 + p3[0][1] * y1;
+        c[2]->scaled_spec[k] = p2[1][0] * x0 + p2[1][1] * y0;
+        c[3]->scaled_spec[k] = p3[1][0] * x1 + p3[1][1] * y1;
+    }
+}
+
+/* TS 103 190-1 clause 5.3.3.5, tracks in ssch[0..4]: table 179 is the three-channel transform of
+ * table 178 on I0-I2 and a 2x2 on I3, I4, then 2x2s pairing their outputs */
+static void five_channel_processing(AC4DecodeContext *s, Substream *ss)
+{
+    SubstreamChannel *c = ss->ssch;
+
+    if (ss->chel_matsel >= FF_ARRAY_ELEMS(chel_matrix))
+        return;
+
+    for (int i = 0; i < 5; i++)
+        chparam_matrix(s, ss, &c[i], ss->matrix_mc[i]);
+
+    for (int k = 0; k < s->frame_len_base; k++) {
+        const int sfb = c[0].offset2sfb[k], g = c[0].offset2g[k];
+        float (*const m[2])[2] = { ss->matrix_mc[0][g][sfb], ss->matrix_mc[1][g][sfb] };
+        float (*p2)[2] = ss->matrix_mc[2][g][sfb], (*p3)[2] = ss->matrix_mc[3][g][sfb];
+        float (*p4)[2] = ss->matrix_mc[4][g][sfb];
+        float in[5], p[3], q0, q1, M[3][3];
+
+        for (int i = 0; i < 5; i++)
+            in[i] = c[i].scaled_spec[k];
+        chel_matrix_3(ss->chel_matsel, m, M);
+        for (int i = 0; i < 3; i++)
+            p[i] = M[i][0] * in[0] + M[i][1] * in[1] + M[i][2] * in[2];
+        q0 = p2[0][0] * in[3] + p2[0][1] * in[4];
+        q1 = p2[1][0] * in[3] + p2[1][1] * in[4];
+
+        c[0].scaled_spec[k] = p3[0][0] * p[0] + p3[0][1] * q0;
+        c[1].scaled_spec[k] = p4[0][0] * p[1] + p4[0][1] * q1;
+        c[2].scaled_spec[k] = p[2];
+        c[3].scaled_spec[k] = p3[1][0] * p[0] + p3[1][1] * q0;
+        c[4].scaled_spec[k] = p4[1][0] * p[1] + p4[1][1] * q1;
+    }
+}
+
+/* TS 103 190-2 clauses 5.2.3.3 and 5.2.3.4: the core of an immersive_channel_element */
+static void immersive_processing(AC4DecodeContext *s, Substream *ss)
+{
+    static const uint8_t tracks_abde[4] = { 0, 1, 3, 4 };
+
+    switch (ss->coding_config) {
+    case 0:
+        if (ss->mdct_stereo_proc[0])
+            two_channel_processing(s, ss, &ss->ssch[0], &ss->ssch[ss->mode_2ch ? 3 : 1]);
+        if (ss->mdct_stereo_proc[1])
+            two_channel_processing(s, ss, &ss->ssch[ss->mode_2ch ? 1 : 3], &ss->ssch[4]);
+        break;
+    case 1:
+        three_channel_processing(s, ss, 0, 1, 2);
+        if (ss->mdct_stereo_proc[0])
+            two_channel_processing(s, ss, &ss->ssch[3], &ss->ssch[4]);
+        break;
+    case 2:
+        four_channel_processing(s, ss, tracks_abde);
+        break;
+    case 3:
+        five_channel_processing(s, ss);
+        break;
+    }
+    if (ss->mdct_stereo_proc[2])
+        two_channel_processing(s, ss, &ss->ssch[7], &ss->ssch[8]);
 }
 
 static void qmf_analysis(AC4DecodeContext *s, SubstreamChannel *ssch)
@@ -6035,8 +6486,9 @@ static void acpl_duck(AC4DecodeContext *s, SubstreamChannel *st, float (*u)[42][
 
 /* pseudocode 116 and 117 for one module: front channel f and surround channel r, from the
  * parameters (and decorrelator d's state) kept in channel f; residual: r carries a residual
- * signal (ASPX_ACPL_1) */
-static void acpl_module(AC4DecodeContext *s, Substream *ss, int f, int r, int d, int residual)
+ * signal (ASPX_ACPL_1); front_gain: of the output in f, r has sqrt(2) */
+static void acpl_module(AC4DecodeContext *s, Substream *ss, int f, int r, int d, int residual,
+                        float front_gain)
 {
     SubstreamChannel *front = &ss->ssch[f], *rear = &ss->ssch[r];
     const int num_ts = s->num_qmf_timeslots;
@@ -6076,7 +6528,7 @@ static void acpl_module(AC4DecodeContext *s, Substream *ss, int f, int r, int d,
                     z0 = 0.5f * (xf * (1.f + a) + yv * b);
                     z1 = 0.5f * (xf * (1.f - a) - yv * b);
                 }
-                front->Q[c][ts][sb] = z0;
+                front->Q[c][ts][sb] = z0 * front_gain;
                 rear->Q[c][ts][sb]  = z1 * (float)M_SQRT2;
             }
         }
@@ -6096,8 +6548,423 @@ static void acpl_5x_processing(AC4DecodeContext *s, Substream *ss)
 {
     const int residual = ss->codec_mode == CM_ASPX_ACPL_1;
 
-    acpl_module(s, ss, 0, 3, 0, residual);      // L -> L, Ls with decorrelator D0
-    acpl_module(s, ss, 1, 4, 1, residual);      // R -> R, Rs with decorrelator D1
+    acpl_module(s, ss, 0, 3, 0, residual, 1.f); // L -> L, Ls with decorrelator D0
+    acpl_module(s, ss, 1, 4, 1, residual, 1.f); // R -> R, Rs with decorrelator D1
+}
+
+/* TS 103 190-2 pseudocode 2 with ASPX_ACPL_2, b_5fronts = 0: Ls -> Ls, Lb and so on */
+static void acpl_immersive_processing(AC4DecodeContext *s, Substream *ss)
+{
+    static const uint8_t direct[3] = { 0, 1, 2 };
+
+    acpl_module(s, ss, 3, 5, 0, 0, M_SQRT2);
+    acpl_module(s, ss, 4, 6, 0, 0, M_SQRT2);
+    acpl_module(s, ss, 7, 9, 1, 0, M_SQRT2);
+    acpl_module(s, ss, 8, 10, 1, 0, M_SQRT2);
+
+    for (int i = 0; i < 3; i++) {
+        SubstreamChannel *ssch = &ss->ssch[direct[i]];
+
+        for (int c = 0; c < 2; c++)
+            for (int ts = 0; ts < s->num_qmf_timeslots; ts++)
+                for (int sb = 0; sb < 64; sb++)
+                    ssch->Q[c][ts][sb] *= 2.f;
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Companding (TS 103 190-1 clause 5.7.5), QMF domain, before A-SPX. The per-slot gain depends on
+ * that slot alone, so instead of following the A-SPX interval (which may reach over the frame
+ * borders) it runs on the time slots of this frame.
+ */
+static void companding(AC4DecodeContext *s, Substream *ss, const uint8_t *chans, int nch)
+{
+    const float alpha = 0.65f, exponent = (1.f - alpha) / alpha, level = 0.9105f;
+    const float G = powf(2.f, 1.f / alpha);
+    const int num_ts = s->num_qmf_timeslots;
+    float g[5][42];
+    float avg[5];
+
+    for (int c = 0; c < nch; c++) {
+        SubstreamChannel *ssch = &ss->ssch[chans[c]];
+        const int k = ssch->sbx;
+
+        avg[c] = 0.f;
+        for (int ts = 0; ts < num_ts; ts++) {
+            float l = 0.f;
+
+            for (int sb = 0; sb < k; sb++) {
+                const float re = fabsf(ssch->Q[0][ts][sb]), im = fabsf(ssch->Q[1][ts][sb]);
+
+                l += FFMAX(re, im) + 0.5f * FFMIN(re, im);
+            }
+            l = k > 0 ? level * l / k : 0.f;
+            avg[c] += l;
+            g[c][ts] = powf(l, exponent);
+        }
+        avg[c] = powf(avg[c] / num_ts, exponent);
+    }
+
+    if (ss->compand_sync) {
+        float mean = 0.f;
+
+        for (int ts = 0; ts < num_ts; ts++) {
+            float sum = 0.f;
+
+            for (int c = 0; c < nch; c++)
+                sum += g[c][ts];
+            sum /= nch;
+            mean += sum;
+            for (int c = 0; c < nch; c++)
+                g[c][ts] = sum;
+        }
+        mean /= num_ts;
+        for (int c = 0; c < nch; c++)
+            avg[c] = mean;
+    }
+
+    for (int c = 0; c < nch; c++) {
+        SubstreamChannel *ssch = &ss->ssch[chans[c]];
+        const int on = ss->compand_on[ss->compand_sync ? 0 : c];
+
+        if (!on && !ss->compand_avg)
+            continue;
+        for (int ts = 0; ts < num_ts; ts++) {
+            const float gain = (on ? g[c][ts] : avg[c]) * G;
+
+            for (int sb = 0; sb < ssch->sbx; sb++) {
+                ssch->Q[0][ts][sb] *= gain;
+                ssch->Q[1][ts][sb] *= gain;
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Advanced joint channel coding, A-JCC (TS 103 190-2 clause 5.6): the 7.X.4 channels rebuilt in
+ * the QMF domain from the five core channels (b_5fronts = 0, full decoding).
+ */
+
+/* pseudocode 3: quantized values of a parameter set from the Huffman-decoded differences */
+static void ajcc_unpack(Substream *ss, int set, int nps, int q[2][15])
+{
+    const int bands = acpl_num_param_bands[ss->ajcc_num_param_bands_id];
+
+    for (int ps = 0; ps < nps; ps++) {
+        const int *d = ss->ajcc_data[set][ps];
+        int *prev = ss->ajcc_q_prev[set];
+
+        if (ss->ajcc_diff_type[set][ps] == 0) {         // DIFF_FREQ
+            q[ps][0] = d[0];
+            for (int i = 1; i < bands; i++)
+                q[ps][i] = q[ps][i - 1] + d[i];
+        } else {                                        // DIFF_TIME
+            for (int i = 0; i < bands; i++)
+                q[ps][i] = prev[i] + d[i];
+        }
+        memcpy(prev, q[ps], sizeof(ss->ajcc_q_prev[set]));
+    }
+}
+
+/* pseudocode 4 and 5 */
+static void ajcc_dequantize(Substream *ss, int set, int nps, float delta, float offset, float out[2][15])
+{
+    const int bands = acpl_num_param_bands[ss->ajcc_num_param_bands_id];
+    int q[2][15] = { { 0 } };
+
+    ajcc_unpack(ss, set, nps, q);
+    for (int ps = 0; ps < nps; ps++)
+        for (int i = 0; i < 15; i++)
+            out[ps][i] = i < bands ? q[ps][i] * delta - offset : 0.f;
+}
+
+static void ajcc_dequantize_ab(Substream *ss, int m, int nps, float alpha[2][15], float beta[2][15])
+{
+    const int bands = acpl_num_param_bands[ss->ajcc_num_param_bands_id];
+    const int fine = ss->ajcc_qm_ab == 0;
+    int qa[2][15] = { { 0 } }, qb[2][15] = { { 0 } };
+
+    ajcc_unpack(ss, AJCC_ALPHA1 + m, nps, qa);
+    ajcc_unpack(ss, AJCC_BETA1 + m, nps, qb);
+    for (int ps = 0; ps < nps; ps++) {
+        for (int i = 0; i < bands; i++) {
+            if (fine) {
+                int a = av_clip(qa[ps][i], 0, 32), b = av_clip(qb[ps][i], 0, 8);
+
+                alpha[ps][i] = acpl_alpha_fine[a];
+                beta[ps][i]  = acpl_beta_fine[b][acpl_ibeta_fine[a]];
+            } else {
+                int a = av_clip(qa[ps][i], 0, 16), b = av_clip(qb[ps][i], 0, 4);
+
+                alpha[ps][i] = acpl_alpha_coarse[a];
+                beta[ps][i]  = acpl_beta_coarse[b][acpl_ibeta_coarse[a]];
+            }
+        }
+    }
+}
+
+/* pseudocode 6: a parameter's value at QMF time slot ts in subband sb */
+static float ajcc_interpolate(AC4DecodeContext *s, Substream *ss, int side, float param[2][15],
+                              const float *prev, int pb, int sb, int ts)
+{
+    const int num_ts = s->num_qmf_timeslots;
+    const int nps = ss->ajcc_nps[side];
+
+    if (ss->ajcc_interpolation_type[side] == 0) {       // smooth
+        if (nps == 1)
+            return prev[sb] + (ts + 1) * (param[0][pb] - prev[sb]) / num_ts;
+        else {
+            const int ts_2 = num_ts / 2;
+
+            if (ts < ts_2)
+                return prev[sb] + (ts + 1) * (param[0][pb] - prev[sb]) / ts_2;
+            return param[0][pb] + (ts - ts_2 + 1) * (param[1][pb] - param[0][pb]) / (num_ts - ts_2);
+        }
+    }
+    // steep
+    if (ts < ss->ajcc_param_timeslot[side][0])
+        return prev[sb];
+    if (nps == 1 || ts < ss->ajcc_param_timeslot[side][1])
+        return param[0][pb];
+    return param[1][pb];
+}
+
+/* pseudocode 11, for one side m (0 left, 1 right): z from core channels x0, x1 and decorrelated
+ * signals y0, y1, y2 */
+static void ajcc_module_2(AC4DecodeContext *s, Substream *ss, int m,
+                          float (*x0)[42][64], float (*x1)[42][64],
+                          float (*y0)[42][64], float (*y1)[42][64], float (*y2)[42][64],
+                          float (*z)[2][42][64])
+{
+    const int nps = ss->ajcc_nps[m];
+    const int bands_id = ss->ajcc_num_param_bands_id;
+    const float r = M_SQRT1_2;
+    float alpha[2][15] = { { 0 } }, beta[2][15] = { { 0 } };
+    float dry1[2][15], dry2[2][15], wet1[2][15], wet2[2][15], wet3[2][15];
+    float delta = ss->ajcc_qm_dw ? 0.2f : 0.1f;
+    float d[10][2][15] = { { { 0 } } }, w[15][2][15] = { { { 0 } } };
+
+    ajcc_dequantize_ab(ss, m, nps, alpha, beta);
+    ajcc_dequantize(ss, AJCC_DRY1 + 2 * m, nps, delta, 0.6f, dry1);
+    ajcc_dequantize(ss, AJCC_DRY2 + 2 * m, nps, delta, 0.6f, dry2);
+    ajcc_dequantize(ss, AJCC_WET1 + 3 * m, nps, delta, 2.0f, wet1);
+    ajcc_dequantize(ss, AJCC_WET2 + 3 * m, nps, delta, 2.0f, wet2);
+    ajcc_dequantize(ss, AJCC_WET3 + 3 * m, nps, delta, 2.0f, wet3);
+
+    for (int ps = 0; ps < nps; ps++) {
+        for (int pb = 0; pb < 15; pb++) {
+            const float a = alpha[ps][pb], b = beta[ps][pb], dr1 = dry1[ps][pb], dr2 = dry2[ps][pb];
+            const float w1 = wet1[ps][pb], w2 = wet2[ps][pb], w3 = wet3[ps][pb];
+
+            if (ss->ajcc_core_mode == 0) {
+                d[0][ps][pb] = (1.f + a) / 2.f;
+                d[3][ps][pb] = (1.f - a) / 2.f;
+                d[6][ps][pb] = dr1;
+                d[7][ps][pb] = dr2;
+                d[9][ps][pb] = 1.f - dr1 - dr2;
+                w[0][ps][pb] = b / 2.f;
+                w[3][ps][pb] = -b / 2.f;
+                w[6][ps][pb] = (w1 + w3) * r;
+                w[7][ps][pb] = -w3 * r;
+                w[9][ps][pb] = -w1 * r;
+                w[11][ps][pb] = (w3 + w2) * r;
+                w[12][ps][pb] = -w2 * r;
+                w[14][ps][pb] = -w3 * r;
+            } else {
+                d[0][ps][pb] = dr1;
+                d[1][ps][pb] = dr2;
+                d[2][ps][pb] = 1.f - dr1 - dr2;
+                d[8][ps][pb] = (1.f + a) / 2.f;
+                d[9][ps][pb] = (1.f - a) / 2.f;
+                w[0][ps][pb] = (w1 + w3) * r;
+                w[1][ps][pb] = -w3 * r;
+                w[2][ps][pb] = -w1 * r;
+                w[5][ps][pb] = (w3 + w2) * r;
+                w[6][ps][pb] = -w2 * r;
+                w[7][ps][pb] = -w3 * r;
+                w[13][ps][pb] = b / 2.f;
+                w[14][ps][pb] = -b / 2.f;
+            }
+        }
+    }
+
+    for (int sb = 0; sb < 64; sb++) {
+        const int pb = sb_to_pb(bands_id, sb);
+
+        for (int ts = 0; ts < s->num_qmf_timeslots; ts++) {
+            float id[10], iw[15];
+
+            for (int i = 0; i < 10; i++)
+                id[i] = ajcc_interpolate(s, ss, m, d[i], ss->ajcc_param_prev[m][i], pb, sb, ts);
+            for (int i = 0; i < 15; i++)
+                iw[i] = ajcc_interpolate(s, ss, m, w[i], ss->ajcc_param_prev[m][10 + i], pb, sb, ts);
+
+            for (int c = 0; c < 2; c++) {
+                const float a = x0[c][ts][sb], b = x1[c][ts][sb];
+                const float e = y0[c][ts][sb], f = y1[c][ts][sb], g = y2[c][ts][sb];
+
+                for (int i = 0; i < 5; i++)
+                    z[i][c][ts][sb] = id[i] * a + id[5 + i] * b + iw[i] * e + iw[5 + i] * f + iw[10 + i] * g;
+            }
+        }
+    }
+
+    // pseudocode 7: the last parameter set, per subband, for the next frame's interpolation
+    for (int sb = 0; sb < 64; sb++) {
+        const int pb = sb_to_pb(bands_id, sb);
+
+        for (int i = 0; i < 10; i++)
+            ss->ajcc_param_prev[m][i][sb] = d[i][nps - 1][pb];
+        for (int i = 0; i < 15; i++)
+            ss->ajcc_param_prev[m][10 + i][sb] = w[i][nps - 1][pb];
+    }
+}
+
+/* pseudocode 9: w1, w2 from x0, x3 and x1, x4 */
+static void ajcc_input_pre_modification(AC4DecodeContext *s, Substream *ss)
+{
+    const int num_ts = s->num_qmf_timeslots;
+    float g = 0.f, d = 0.f;
+
+    if (ss->ajcc_core_mode_prev < 0)
+        ss->ajcc_core_mode_prev = ss->ajcc_core_mode;
+
+    if (ss->ajcc_core_mode == ss->ajcc_core_mode_prev) {
+        if (ss->ajcc_core_mode == 0)
+            g = 1.f;
+    } else {
+        if (ss->ajcc_core_mode == 0) {
+            d = 1.f / num_ts;
+        } else {
+            g = 1.f;
+            d = -1.f / num_ts;
+        }
+        ss->ajcc_core_mode_prev = ss->ajcc_core_mode;
+    }
+
+    for (int ts = 0; ts < num_ts; ts++) {
+        g += d;
+        for (int c = 0; c < 2; c++) {
+            for (int sb = 0; sb < 64; sb++) {
+                ss->ajcc_w[0][c][ts][sb] = g * ss->ajcc_x[3][c][ts][sb] + (1.f - g) * ss->ajcc_x[0][c][ts][sb];
+                ss->ajcc_w[1][c][ts][sb] = g * ss->ajcc_x[4][c][ts][sb] + (1.f - g) * ss->ajcc_x[1][c][ts][sb];
+            }
+        }
+    }
+}
+
+/* pseudocode 8, b_5fronts = 0: the output channels in ssch[] by speaker index */
+static void ajcc_processing(AC4DecodeContext *s, Substream *ss)
+{
+    /* decorrelator instance: its input, the decorrelator, and the channel that keeps its state */
+    const struct { float (*in)[42][64]; int d, state; } dec[6] = {
+        { ss->ajcc_x[0], 0, 0 }, { ss->ajcc_w[0], 2, 5 }, { ss->ajcc_x[3], 1, 3 },
+        { ss->ajcc_x[1], 0, 1 }, { ss->ajcc_w[1], 2, 6 }, { ss->ajcc_x[4], 1, 4 },
+    };
+    static const uint8_t out[2][5] = { { 0, 3, 5, 7, 9 }, { 1, 4, 6, 8, 10 } };
+    const float scale = 2.f + M_SQRT1_2;
+    const int num_ts = s->num_qmf_timeslots;
+
+    for (int i = 0; i < 5; i++)
+        for (int c = 0; c < 2; c++)
+            for (int ts = 0; ts < num_ts; ts++)
+                for (int sb = 0; sb < 64; sb++)
+                    ss->ajcc_x[i][c][ts][sb] = scale * ss->ssch[i].Q[c][ts][sb];
+
+    ajcc_input_pre_modification(s, ss);
+
+    for (int i = 0; i < 6; i++) {
+        acpl_decorrelate(s, &ss->ssch[dec[i].state], dec[i].d, dec[i].in, ss->ajcc_y[i]);
+        acpl_duck(s, &ss->ssch[dec[i].state], ss->ajcc_y[i]);
+    }
+
+    for (int m = 0; m < 2; m++) {
+        ajcc_module_2(s, ss, m, ss->ajcc_x[m], ss->ajcc_x[3 + m],
+                      ss->ajcc_y[3 * m], ss->ajcc_y[3 * m + 1], ss->ajcc_y[3 * m + 2], ss->ajcc_z);
+
+        for (int i = 0; i < 5; i++) {
+            SubstreamChannel *ssch = &ss->ssch[out[m][i]];
+            const float gain = i ? (float)M_SQRT2 : 1.f;
+
+            for (int c = 0; c < 2; c++)
+                for (int ts = 0; ts < num_ts; ts++)
+                    for (int sb = 0; sb < 64; sb++)
+                        ssch->Q[c][ts][sb] = gain * ss->ajcc_z[i][c][ts][sb];
+        }
+    }
+
+    for (int c = 0; c < 2; c++)
+        for (int ts = 0; ts < num_ts; ts++)
+            for (int sb = 0; sb < 64; sb++)
+                ss->ssch[2].Q[c][ts][sb] = ss->ajcc_x[2][c][ts][sb];
+}
+
+/* the output channel layout of a substream's channel mode */
+static uint64_t output_layout(AC4DecodeContext *s, const SubstreamInfo *ssi)
+{
+    if (ssi->channel_mode == 11 || ssi->channel_mode == 12) {
+        uint64_t layout = AV_CH_LAYOUT_5POINT0;
+
+        if (ssi->channel_mode == 12)
+            layout |= AV_CH_LOW_FREQUENCY;
+        if (s->immersive_output == IMMERSIVE_OUT_7_1 ||
+            (s->immersive_output == IMMERSIVE_OUT_TOP && ssi->back_channels_present))
+            layout |= AV_CH_BACK_LEFT | AV_CH_BACK_RIGHT;
+        if (s->immersive_output == IMMERSIVE_OUT_TOP)
+            layout |= AV_CH_TOP_FRONT_LEFT | AV_CH_TOP_FRONT_RIGHT |
+                      AV_CH_TOP_BACK_LEFT | AV_CH_TOP_BACK_RIGHT;
+        return layout;
+    }
+    if (ssi->channel_mode < 0 || ssi->channel_mode >= FF_ARRAY_ELEMS(channel_mode_layouts))
+        return 0;
+    return channel_mode_layouts[ssi->channel_mode];
+}
+
+/* TS 103 190-2 clause 5.10.2.5, tables 38, 40, 41 and 43 with the default custom downmix
+ * parameters of table 130 (gain_b, gain_t2b and gain_t2e -3 dB, the others off): top channels into
+ * the side channels, and for 5.1 output the back channels too. Channels by speaker index. */
+static void immersive_render(AC4DecodeContext *s, Substream *ss, const SubstreamInfo *ssi, AVFrame *frame)
+{
+    static const int8_t order[3][12] = {
+        { 0, 1, 2, 11, 3, 4 },                              // FL FR FC LFE SL SR
+        { 0, 1, 2, 11, 5, 6, 3, 4 },                        // FL FR FC LFE BL BR SL SR
+        { 0, 1, 2, 11, 3, 4, 7, 8, 9, 10 },                 // ... TFL TFR TBL TBR
+    };
+    static const int8_t order_7_1_4[12] = { 0, 1, 2, 11, 5, 6, 3, 4, 7, 8, 9, 10 };
+    const int lfe = ssi->channel_mode == 12;
+    const int top = s->immersive_output == IMMERSIVE_OUT_TOP;
+    const int nb_ch = s->avctx->ch_layout.nb_channels;
+    const int n = s->frame_len_base;
+    const float m3db = 0.70794578f;                         // -3 dB
+    const int8_t *o = top && ssi->back_channels_present ? order_7_1_4 : order[s->immersive_output];
+
+    for (int ch = 0; ch < 12; ch++) {
+        if ((ch == 11 && !lfe) || ((ch == 5 || ch == 6) && !ssi->back_channels_present) ||
+            (ch >= 7 && ch <= 10 && !ssi->top_channels_present)) {
+            memset(s->render_pcm[ch], 0, n * sizeof(float));
+            continue;
+        }
+        qmf_synthesis(s, &ss->ssch[ch], s->render_pcm[ch]);
+    }
+
+    if (!top) {
+        for (int side = 0; side < 2; side++) {
+            float *ls = s->render_pcm[3 + side], *lb = s->render_pcm[5 + side];
+            const float *tf = s->render_pcm[7 + side], *tb = s->render_pcm[9 + side];
+
+            if (s->immersive_output == IMMERSIVE_OUT_5_1 && ssi->back_channels_present)
+                for (int i = 0; i < n; i++)
+                    ls[i] = m3db * (ls[i] + lb[i]);
+            for (int i = 0; i < n; i++)
+                ls[i] += m3db * (tf[i] + tb[i]);
+        }
+    }
+
+    for (int ch = 0, out = 0; out < nb_ch; ch++) {
+        if (o[ch] == 11 && !lfe)
+            continue;
+        memcpy(frame->extended_data[out++], s->render_pcm[o[ch]], n * sizeof(float));
+    }
 }
 
 static void decode_channel(AC4DecodeContext *s, int ch, float *pcm)
@@ -6154,7 +7021,7 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     avctx->sample_rate = av_rescale(s->fs_index ? 48000 : 44100,
                                     s->resampling_ratio.den, s->resampling_ratio.num);
     av_channel_layout_uninit(&avctx->ch_layout);
-    av_channel_layout_from_mask(&avctx->ch_layout, channel_mode_layouts[ssinfo->channel_mode]);
+    av_channel_layout_from_mask(&avctx->ch_layout, output_layout(s, ssinfo));
     frame->nb_samples = s->frame_len_base;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
@@ -6183,6 +7050,43 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     if (get_bits_left(gb) < 0)
         av_log(s->avctx, AV_LOG_WARNING, "overread\n");
+
+    if (ssinfo->channel_mode == 11 || ssinfo->channel_mode == 12) {
+        static const uint8_t core[7] = { 0, 1, 2, 3, 4, 7, 8 };
+        Substream *ss = &s->substream;
+        const int ajcc = ss->immersive_codec_mode == ICM_ASPX_AJCC;
+        const int nb_core = ajcc ? 5 : 7;
+
+        for (int i = 0; i < nb_core; i++)
+            scale_spec(s, core[i]);
+        if (ssinfo->channel_mode == 12)
+            scale_spec(s, 11);
+        immersive_processing(s, ss);
+
+        for (int i = 0; i < nb_core; i++)
+            if ((ret = prepare_channel(s, core[i])) < 0)
+                return ret;
+        if (ssinfo->channel_mode == 12 && (ret = prepare_channel(s, 11)) < 0)
+            return ret;
+
+        if (ajcc && s->companding)
+            companding(s, ss, core, 5);
+        aspx_2ch(s, ss, 0, 1);
+        aspx_2ch(s, ss, 3, 4);
+        if (!ajcc)
+            aspx_2ch(s, ss, 7, 8);
+        aspx_1ch(s, ss, 2);
+        if (ajcc)
+            ajcc_processing(s, ss);
+        else
+            acpl_immersive_processing(s, ss);
+
+        immersive_render(s, ss, ssinfo, frame);
+
+        frame->key_frame = s->iframe_global;
+        *got_frame_ptr = 1;
+        return avpkt->size;
+    }
 
     for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++)
         scale_spec(s, ch);
@@ -6251,6 +7155,9 @@ static av_cold void ac4_flush(AVCodecContext *avctx)
 
     s->have_iframe = 0;
     s->sequence_counter_prev = 0;
+    s->substream.ajcc_core_mode_prev = -1;
+    memset(s->substream.ajcc_q_prev, 0, sizeof(s->substream.ajcc_q_prev));
+    memset(s->substream.ajcc_param_prev, 0, sizeof(s->substream.ajcc_param_prev));
 }
 
 static av_cold int ac4_decode_end(AVCodecContext *avctx)
@@ -6272,6 +7179,11 @@ static av_cold int ac4_decode_end(AVCodecContext *avctx)
 static const AVOption options[] = {
     { "presentation", "select presentation", OFFSET(target_presentation), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, INT_MAX, FLAGS },
     { "aspx_5x", "apply A-SPX in 5.x channel elements", OFFSET(aspx_5x), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, FLAGS },
+    { "immersive_output", "output of immersive (x.x.4) streams", OFFSET(immersive_output), AV_OPT_TYPE_INT, {.i64 = IMMERSIVE_OUT_5_1 }, 0, IMMERSIVE_OUT_TOP, FLAGS, "immersive_output" },
+    { "5.1", "render to 5.1", 0, AV_OPT_TYPE_CONST, {.i64 = IMMERSIVE_OUT_5_1 }, 0, 0, FLAGS, "immersive_output" },
+    { "7.1", "render to 7.1", 0, AV_OPT_TYPE_CONST, {.i64 = IMMERSIVE_OUT_7_1 }, 0, 0, FLAGS, "immersive_output" },
+    { "top", "the decoded channels, 5.1.4 or 7.1.4", 0, AV_OPT_TYPE_CONST, {.i64 = IMMERSIVE_OUT_TOP }, 0, 0, FLAGS, "immersive_output" },
+    { "companding", "apply the companding tool in ASPX_AJCC elements", OFFSET(companding), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, FLAGS },
     { NULL},
 };
 
