@@ -88,6 +88,12 @@ its 29.97 fps version lasts as long as the reference.
   only, so 5.1 stopped at the core coder's bandwidth (about 14 kHz). The
   stereo and mono A-SPX processing now serves 5.x channels too, before A-CPL.
   (Decoder option `aspx_5x` turns it off, for comparison.)
+- **A-SPX gains.** The band above the A-SPX crossover came out too low and too
+  noisy, most of all for speech in the center channel. Fixed from TS 103 190-1
+  clause 5.7.6: Huffman offsets of the first envelope value, noise floor
+  deltas, the envelope estimate, the 16-bit working scale, the time alignment
+  of Q_high, the limiter groups, time deltas across frequency resolution and
+  step size changes, and alpha coefficients (which overflowed float).
 - **Sample rate (speed and pitch).** The decoder output each frame at 48 kHz
   without the resampling the specification requires (TS 103 190-1 4.3.3.2.6,
   6.2.15): ATSC 3.0 audio (29.97 fps) played 4 % fast and 0.7 semitone sharp,

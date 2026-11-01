@@ -334,17 +334,17 @@ static const uint16_t aspx_hcb_noise_balance_dt_codes[25] = {
 static uint8_t aspx_codebook_signal_off[2][2][3] = {
     {
         {  0, 70, 70, },
-        { 36, 35, 35, },
+        {  0, 35, 35, },
     },
     {
-        { 25, 24, 24, },
-        { 13, 12, 12, },
+        {  0, 24, 24, },
+        {  0, 12, 12, },
     },
 };
 
 static uint8_t aspx_codebook_noise_off[2][3] = {
-        { 30, 29, 29, },
-        { 13, 12, 12, },
+        {  0, 29, 29, },
+        {  0, 12, 12, },
 };
 
 static const uint8_t scale_factors_bits[121] = {

@@ -159,6 +159,7 @@ typedef struct SubstreamChannel {
     int     aspx_tsg_ptr_prev;
 
     int     aspx_qmode_env;
+    int     aspx_qmode_env_prev;
     int     aspx_sig_delta_dir[8];
     int     aspx_noise_delta_dir[2];
     int     aspx_tna_mode[16];
@@ -170,7 +171,7 @@ typedef struct SubstreamChannel {
     int     aspx_balance;
 
     uint8_t atsg_freqres[5];
-    uint8_t atsg_freqres_prev[5];
+    uint8_t freqres_last_prev;               ///< frequency resolution of the previous interval's last envelope
     int     atsg_sig[6];
     int     atsg_noise[3];
     int     previous_stop_pos;
@@ -191,7 +192,6 @@ typedef struct SubstreamChannel {
 
     int     aspx_data[2][5][64];
 
-    int     qscf_prev[5][64];
     int     qscf_noise_prev[2][64];
     int     qscf_sig_sbg[5][64];
     int     qscf_sig_sbg_prev[5][64];
@@ -4956,34 +4956,40 @@ static int get_qsignal_scale_factors(AC4DecodeContext *s, SubstreamChannel *ssch
 
     /* Loop over Envelopes */
     for (int atsg = 0; atsg < ssch->aspx_num_env; atsg++) {
+        int freq_res_prev = atsg ? ssch->atsg_freqres[atsg - 1] : ssch->freqres_last_prev;
+
         /* Loop over scale factor subband groups */
         for (int sbg = 0; sbg < ssch->num_sbg_sig[atsg]; sbg++) {
-            if (atsg == 0) {
-                ssch->atsg_freqres_prev[atsg] = ssch->atsg_freqres[ssch->aspx_num_env_prev - 1];
-                ssch->qscf_prev[atsg][sbg] = ssch->qscf_sig_sbg_prev[ssch->aspx_num_env_prev - 1][sbg];
-            } else {
-                ssch->atsg_freqres_prev[atsg] = ssch->atsg_freqres[atsg-1];
-                ssch->qscf_prev[atsg][sbg] = ssch->qscf_sig_sbg[atsg-1][sbg];
-            }
+            int sbg_prev = sbg;
+
+            if (!ssch->atsg_freqres[atsg] && freq_res_prev)
+                sbg_prev = sbg_idx_low2high[sbg];
+            else if (ssch->atsg_freqres[atsg] && !freq_res_prev)
+                sbg_prev = sbg_idx_high2low[sbg];
+
             if (ssch->aspx_sig_delta_dir[atsg] == 0) { /* FREQ */
                 ssch->qscf_sig_sbg[atsg][sbg] = 0;
                 for (int i = 0; i <= sbg; i++) {
                     ssch->qscf_sig_sbg[atsg][sbg] += delta * ssch->aspx_data[0][atsg][i];
                 }
             } else { /* TIME */
-                if (ssch->atsg_freqres[atsg] == ssch->atsg_freqres_prev[atsg]) {
-                    ssch->qscf_sig_sbg[atsg][sbg]  = ssch->qscf_prev[atsg][sbg];
-                    ssch->qscf_sig_sbg[atsg][sbg] += delta * ssch->aspx_data[0][atsg][sbg];
-                } else if ((ssch->atsg_freqres[atsg] == 0) && (ssch->atsg_freqres_prev[atsg] == 1)) {
-                    ssch->qscf_sig_sbg[atsg][sbg]  = ssch->qscf_prev[atsg][sbg_idx_low2high[sbg]];
-                    ssch->qscf_sig_sbg[atsg][sbg] += delta * ssch->aspx_data[0][atsg][sbg];
-                } else if ((ssch->atsg_freqres[atsg] == 1) && (ssch->atsg_freqres_prev[atsg] == 0)) {
-                    ssch->qscf_sig_sbg[atsg][sbg]  = ssch->qscf_prev[atsg][sbg_idx_high2low[sbg]];
-                    ssch->qscf_sig_sbg[atsg][sbg] += delta * ssch->aspx_data[0][atsg][sbg];
+                if (atsg) {
+                    ssch->qscf_sig_sbg[atsg][sbg] = ssch->qscf_sig_sbg[atsg-1][sbg_prev];
+                } else {
+                    int prev = ssch->qscf_sig_sbg_prev[ssch->aspx_num_env_prev - 1][sbg_prev];
+
+                    /* the previous interval may have used the other step size */
+                    if (ssch->aspx_qmode_env != ssch->aspx_qmode_env_prev)
+                        prev = ssch->aspx_qmode_env ? prev / 2 : prev * 2;
+                    ssch->qscf_sig_sbg[atsg][sbg] = prev;
                 }
+                ssch->qscf_sig_sbg[atsg][sbg] += delta * ssch->aspx_data[0][atsg][sbg];
             }
         }
     }
+
+    ssch->freqres_last_prev = ssch->atsg_freqres[ssch->aspx_num_env - 1];
+    ssch->aspx_qmode_env_prev = ssch->aspx_qmode_env;
 
     return 0;
 }
@@ -5003,7 +5009,7 @@ static int get_qnoise_scale_factors(AC4DecodeContext *s, SubstreamChannel *ssch,
         for (int sbg = 0; sbg < ssch->num_sbg_noise; sbg++) {
             if (ssch->aspx_noise_delta_dir[atsg] == 0) { /* FREQ */
                 for (int i = 0; i <= sbg; i++) {
-                    ssch->qscf_noise_sbg[atsg][sbg] += delta * ssch->aspx_data[1][atsg][sbg];
+                    ssch->qscf_noise_sbg[atsg][sbg] += delta * ssch->aspx_data[1][atsg][i];
                 }
             } else { /* TIME */
                 if (atsg == 0) {
@@ -5067,6 +5073,8 @@ static int prepare_channel(AC4DecodeContext *s, int ch)
     return 0;
 }
 
+/* Q holds samples around +-1, the A-SPX scale factors and EPSILONs assume +-32768:
+ * Q_low, Q_high and Y are in that scale, assemble_hf_signal() goes back to Q's. */
 static void aspx_processing(AC4DecodeContext *s, SubstreamChannel *ssch)
 {
     memcpy(ssch->Q_low_prev, ssch->Q_low, sizeof(ssch->Q_low));
@@ -5074,8 +5082,8 @@ static void aspx_processing(AC4DecodeContext *s, SubstreamChannel *ssch)
     for (int ts = 0; ts < s->ts_offset_hfgen; ts++) {
         for (int sb = 0; sb < 64; sb++) {
             if (sb < ssch->sbx) {
-                ssch->Q_low[0][ts][sb] = ssch->Q_prev[0][ts + s->num_qmf_timeslots - s->ts_offset_hfgen][sb];
-                ssch->Q_low[1][ts][sb] = ssch->Q_prev[1][ts + s->num_qmf_timeslots - s->ts_offset_hfgen][sb];
+                ssch->Q_low[0][ts][sb] = ssch->Q_prev[0][ts + s->num_qmf_timeslots - s->ts_offset_hfgen][sb] * 32768.f;
+                ssch->Q_low[1][ts][sb] = ssch->Q_prev[1][ts + s->num_qmf_timeslots - s->ts_offset_hfgen][sb] * 32768.f;
             }
         }
     }
@@ -5083,8 +5091,8 @@ static void aspx_processing(AC4DecodeContext *s, SubstreamChannel *ssch)
     for (int ts = s->ts_offset_hfgen; ts < s->num_qmf_timeslots + s->ts_offset_hfgen; ts++) {
         for (int sb = 0; sb < 64; sb++) {
             if (sb < ssch->sbx) {
-                ssch->Q_low[0][ts][sb] = ssch->Q[0][ts - s->ts_offset_hfgen][sb];
-                ssch->Q_low[1][ts][sb] = ssch->Q[1][ts - s->ts_offset_hfgen][sb];
+                ssch->Q_low[0][ts][sb] = ssch->Q[0][ts - s->ts_offset_hfgen][sb] * 32768.f;
+                ssch->Q_low[1][ts][sb] = ssch->Q[1][ts - s->ts_offset_hfgen][sb] * 32768.f;
             }
         }
     }
@@ -5262,45 +5270,47 @@ static void get_covariance(AC4DecodeContext *s, SubstreamChannel *ssch)
     }
 }
 
-static float sqr(float a, float b)
-{
-    return a * a + b * b;
-}
-
-static void fcomplex_div(float *r, float *i, float x, float yi, float u, float vi)
-{
-    *r = (x*u + yi*vi) / sqr(u, vi);
-    *i = (x*vi - u*yi) / sqr(u, vi);
-}
-
 static void get_alphas(AC4DecodeContext *s, SubstreamChannel *ssch)
 {
-    float EPSILON_INV = powf(2.f, -20.f);
+    const double EPSILON_INV = 1.0 / (1 << 20);
 
+    /* Q_low is in the 16-bit scale: these products do not fit in a float */
     for (int sb = 0; sb < ssch->sba; sb++) {
-        float denom[2];
+        const float (*cov)[3][2] = (const float (*)[3][2])ssch->cov[sb];
+        double c01r = cov[0][1][0], c01i = cov[0][1][1];
+        double c02r = cov[0][2][0], c02i = cov[0][2][1];
+        double c11r = cov[1][1][0], c11i = cov[1][1][1];
+        double c12r = cov[1][2][0], c12i = cov[1][2][1];
+        double c22r = cov[2][2][0], c22i = cov[2][2][1];
+        double dr, di, d2, ar, ai, a1r = 0, a1i = 0, a0r = 0, a0i = 0;
 
-        fcomplex_mul(&denom[0], &denom[1], ssch->cov[sb][2][2][0], ssch->cov[sb][2][2][1], ssch->cov[sb][1][1][0], ssch->cov[sb][1][1][1]);
-        denom[0] -= sqr(ssch->cov[sb][1][2][0], ssch->cov[sb][1][2][1]) / (1.f+EPSILON_INV);
-        if (sqr(denom[0], denom[1]) <= 1e-6f) {
-            ssch->alpha1[sb][0] = 0;
-            ssch->alpha1[sb][1] = 0;
-        } else {
-            ssch->alpha1[sb][0]  = (ssch->cov[sb][0][1][0] * ssch->cov[sb][1][2][0] - ssch->cov[sb][0][1][1] * ssch->cov[sb][1][2][1]) -
-                                   (ssch->cov[sb][0][2][0] * ssch->cov[sb][1][1][0] - ssch->cov[sb][0][2][1] * ssch->cov[sb][1][1][1]);
-            ssch->alpha1[sb][1]  = (ssch->cov[sb][0][1][0] * ssch->cov[sb][1][2][1] + ssch->cov[sb][0][1][1] * ssch->cov[sb][1][2][0]) -
-                                   (ssch->cov[sb][0][2][0] * ssch->cov[sb][1][1][1] + ssch->cov[sb][0][2][1] * ssch->cov[sb][1][1][0]);
-            fcomplex_div(&ssch->alpha1[sb][0], &ssch->alpha1[sb][1], ssch->alpha1[sb][0], ssch->alpha1[sb][1], denom[0], denom[1]);
+        dr = c22r * c11r - c22i * c11i;
+        di = c22r * c11i + c22i * c11r;
+        dr -= (c12r * c12r + c12i * c12i) / (1.0 + EPSILON_INV);
+        d2 = dr * dr + di * di;
+        if (d2 != 0) {
+            ar = (c01r * c12r - c01i * c12i) - (c02r * c11r - c02i * c11i);
+            ai = (c01r * c12i + c01i * c12r) - (c02r * c11i + c02i * c11r);
+            a1r = (ar * dr + ai * di) / d2;
+            a1i = (ai * dr - ar * di) / d2;
         }
 
-        if (sqr(ssch->cov[sb][1][1][0], ssch->cov[sb][1][1][1]) <= 1e-6f) {
-            ssch->alpha0[sb][0] = 0;
-            ssch->alpha0[sb][1] = 0;
-        } else {
-            ssch->alpha0[sb][0]  = -ssch->cov[sb][0][1][0] + ssch->alpha1[sb][0] * ssch->cov[sb][1][2][0] + ssch->alpha1[sb][1] * ssch->cov[sb][1][2][1];
-            ssch->alpha0[sb][1]  = -ssch->cov[sb][0][1][1] + ssch->alpha1[sb][1] * ssch->cov[sb][1][2][0] - ssch->alpha1[sb][0] * ssch->cov[sb][1][2][1];
-            fcomplex_div(&ssch->alpha0[sb][0], &ssch->alpha0[sb][1], ssch->alpha0[sb][0], ssch->alpha0[sb][1], ssch->cov[sb][1][1][0], ssch->cov[sb][1][1][1]);
+        d2 = c11r * c11r + c11i * c11i;
+        if (d2 != 0) {
+            ar = -c01r + a1r * c12r + a1i * c12i;
+            ai = -c01i + a1i * c12r - a1r * c12i;
+            a0r = (ar * c11r + ai * c11i) / d2;
+            a0i = (ai * c11r - ar * c11i) / d2;
         }
+
+        if (a0r * a0r + a0i * a0i >= 16 || a1r * a1r + a1i * a1i >= 16 ||
+            !isfinite(a0r + a0i + a1r + a1i))
+            a0r = a0i = a1r = a1i = 0;
+
+        ssch->alpha0[sb][0] = a0r;
+        ssch->alpha0[sb][1] = a0i;
+        ssch->alpha1[sb][0] = a1r;
+        ssch->alpha1[sb][1] = a1i;
     }
 }
 
@@ -5350,8 +5360,6 @@ static void create_high_signal(AC4DecodeContext *s, Substream *ss, SubstreamChan
 
 static void estimate_spectral_envelopes(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch)
 {
-    int ts_offset_hfadj = 4;
-
     for (int atsg = 0; atsg < ssch->aspx_num_env; atsg++) {
         int sbg = 0;
         /* Loop over QMF subbands in A-SPX range */
@@ -5360,18 +5368,19 @@ static void estimate_spectral_envelopes(AC4DecodeContext *s, Substream *ss, Subs
             float est_sig = 0;
 
             /* Update current subband group */
-            if (sb == ssch->sbg_sig[atsg][sbg+1])
+            if (sb + ssch->sbx == ssch->sbg_sig[atsg][sbg+1])
                 sbg++;
 
-            tsa = ssch->atsg_sig[atsg]*s->num_ts_in_ats + ts_offset_hfadj;
-            tsz = ssch->atsg_sig[atsg+1]*s->num_ts_in_ats + ts_offset_hfadj;
+            tsa = ssch->atsg_sig[atsg]*s->num_ts_in_ats;
+            tsz = ssch->atsg_sig[atsg+1]*s->num_ts_in_ats;
             for (int ts = tsa; ts < tsz; ts++) {
                 if (ss->aspx_interpolation == 0) {
                     for (int j = ssch->sbg_sig[atsg][sbg]; j < ssch->sbg_sig[atsg][sbg+1]; j++) {
-                        est_sig += hypotf(ssch->Q_high[0][ts][j], ssch->Q_high[1][ts][j]);
+                        est_sig += ssch->Q_high[0][ts][j] * ssch->Q_high[0][ts][j] + ssch->Q_high[1][ts][j] * ssch->Q_high[1][ts][j];
                     }
                 } else {
-                    est_sig += hypotf(ssch->Q_high[0][ts][sb+ssch->sbx], ssch->Q_high[1][ts][sb+ssch->sbx]);
+                    est_sig += ssch->Q_high[0][ts][sb+ssch->sbx] * ssch->Q_high[0][ts][sb+ssch->sbx] +
+                               ssch->Q_high[1][ts][sb+ssch->sbx] * ssch->Q_high[1][ts][sb+ssch->sbx];
                 }
             }
 
@@ -5433,7 +5442,7 @@ static void add_sinusoids(AC4DecodeContext *s, SubstreamChannel *ssch)
         for (int sbg = 0; sbg < ssch->num_sbg_sig_highres; sbg++) {
             int sba = ssch->sbg_sig_highres[sbg] - ssch->sbx;
             int sbz = ssch->sbg_sig_highres[sbg+1] - ssch->sbx;
-            int sb_mid = (int)(0.5f*(sbz + sba) + 0.5f);
+            int sb_mid = (sbz + sba) / 2;
             /* Map sinusoid markers to QMF subbands */
             for (int sb = ssch->sbg_sig_highres[sbg]-ssch->sbx; sb < ssch->sbg_sig_highres[sbg+1]-ssch->sbx; sb++) {
                 if ((sb == sb_mid) && ((atsg >= ssch->aspx_tsg_ptr) || (p_sine_at_end == 0)
@@ -5501,7 +5510,7 @@ static void add_sinusoids(AC4DecodeContext *s, SubstreamChannel *ssch)
         for (int sbg = 0; sbg < ssch->num_sbg_lim; sbg++) {
             float nom = 0;
             float denom = EPSILON0;
-            for (int sb = ssch->sbg_lim[sbg]-ssch->sbx; sb < ssch->sbg_lim[sbg+1]-1-ssch->sbx; sb++) {
+            for (int sb = ssch->sbg_lim[sbg]-ssch->sbx; sb < ssch->sbg_lim[sbg+1]-ssch->sbx; sb++) {
                 nom += ssch->scf_sig_sb[atsg][sb];
                 denom += ssch->est_sig_sb[atsg][sb];
             }
@@ -5547,7 +5556,7 @@ static void add_sinusoids(AC4DecodeContext *s, SubstreamChannel *ssch)
 
             nom = denom = EPSILON0;
             /* Loop over subbands */
-            for (int sb = ssch->sbg_lim[sbg]-ssch->sbx; sb < ssch->sbg_lim[sbg+1]-1-ssch->sbx; sb++) {
+            for (int sb = ssch->sbg_lim[sbg]-ssch->sbx; sb < ssch->sbg_lim[sbg+1]-ssch->sbx; sb++) {
                 nom   += ssch->scf_sig_sb[atsg][sb];
                 denom += ssch->est_sig_sb[atsg][sb] * powf(ssch->sig_gain_sb_lim[atsg][sb], 2);
                 denom += powf(ssch->sine_lev_sb[atsg][sb], 2);
@@ -5660,7 +5669,6 @@ static void generate_tones(AC4DecodeContext *s, SubstreamChannel *ssch)
 
 static void assemble_hf_signal(AC4DecodeContext *s, SubstreamChannel *ssch)
 {
-    int ts_offset_hfadj = 4;
     int atsg = 0;
 
     memcpy(ssch->Y_prev, ssch->Y, sizeof(ssch->Y));
@@ -5685,8 +5693,8 @@ static void assemble_hf_signal(AC4DecodeContext *s, SubstreamChannel *ssch)
             ssch->Y[1][ts][sb] = 0;
             fcomplex_mul(&ssch->Y[0][ts][sb], &ssch->Y[1][ts][sb],
                          ssch->Y[0][ts][sb], ssch->Y[1][ts][sb],
-                         ssch->Q_high[0][ts + ts_offset_hfadj][sb + ssch->sbx],
-                         ssch->Q_high[1][ts + ts_offset_hfadj][sb + ssch->sbx]);
+                         ssch->Q_high[0][ts][sb + ssch->sbx],
+                         ssch->Q_high[1][ts][sb + ssch->sbx]);
         }
     }
 
